@@ -1,3 +1,4 @@
+mamba-ssm
 torch
 torchvision
 lpips
