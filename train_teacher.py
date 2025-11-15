@@ -1,4 +1,23 @@
-# File: train_teacher.py
+import sys
+import os
+
+# --- NEW CODE: Fix for 'basicsr' ModuleNotFoundError ---
+# We must add the MambaIR submodule path to the system path
+# so that its internal 'from basicsr...' imports can work.
+
+# Get the absolute path to the directory containing this script
+project_root = os.path.dirname(os.path.abspath(__file__))
+
+# Construct the path to the MambaIR package
+mambair_path = os.path.join(project_root, 'models', 'external', 'MambaIR')
+
+# Add this path to the beginning of the sys.path
+if mambair_path not in sys.path:
+    sys.path.insert(0, mambair_path)
+# --- END NEW CODE ---
+
+
+# --- Original code continues below ---
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,8 +30,8 @@ from models.mambair_teacher import FrequencyAwareTeacher
 from losses.frequency_loss import FFTAmplitudeLoss
 
 # --- Config ---
-TRAIN_DIR = "data/UDC-SIT_subset/train" # This folder contains 'input' and 'GT'
-VAL_DIR = "data/UDC-SIT_subset/val"     # This folder contains 'input' and 'GT'
+TRAIN_DIR = "data/UDC-SIT_subset/train"
+VAL_DIR = "data/UDC-SIT_subset/val"
 PATCH_SIZE = 256
 BATCH_SIZE = 4  # Adjust based on Colab Pro GPU (A100/V100)
 LEARNING_RATE = 1e-4
@@ -60,7 +79,7 @@ def main():
         
         for udc_batch, gt_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             udc_batch = udc_batch.to(DEVICE)
-            gt_batch = gt_batch.to(DEVICE) # Shape (B, 3, H, W) - Assuming GT is 3-channel
+            gt_batch = gt_batch.to(DEVICE) 
 
             # Check if GT is 4-channel and select RGB
             if gt_batch.shape[1] == 4:
@@ -73,7 +92,9 @@ def main():
             
             # Compute losses
             loss_pixel = pixel_loss_fn(pred_batch, gt_batch_rgb)
-            loss_perceptual = perceptual_loss_fn(pred_batch, gt_batch_rgb).mean()
+            # LPIPS expects input in range [-1, 1], our data is [0, 1]
+            # We scale it: (x * 2) - 1
+            loss_perceptual = perceptual_loss_fn(pred_batch * 2 - 1, gt_batch_rgb * 2 - 1).mean()
             loss_fft = fft_loss_fn(pred_batch, gt_batch_rgb)
             
             total_loss = (W_PIXEL * loss_pixel) + \
