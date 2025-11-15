@@ -6,6 +6,7 @@ __pycache__/
 # Data - NEVER commit the dataset
 data/UDC-SIT_full/
 data/UDC-SIT_subset/
+*.tar.gz
 
 # Model Checkpoints
 *.pth

@@ -11,8 +11,8 @@ from models.mambair_teacher import FrequencyAwareTeacher
 from losses.frequency_loss import FFTAmplitudeLoss
 
 # --- Config ---
-TRAIN_DIR = "data/UDC-SIT_subset/train"
-VAL_DIR = "data/UDC-SIT_subset/val"
+TRAIN_DIR = "data/UDC-SIT_subset/train" # This folder contains 'input' and 'GT'
+VAL_DIR = "data/UDC-SIT_subset/val"     # This folder contains 'input' and 'GT'
 PATCH_SIZE = 256
 BATCH_SIZE = 4  # Adjust based on Colab Pro GPU (A100/V100)
 LEARNING_RATE = 1e-4
