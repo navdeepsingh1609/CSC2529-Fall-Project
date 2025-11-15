@@ -10,6 +10,8 @@ data/UDC-SIT_subset/
 
 # Model Checkpoints
 *.pth
+*.pt
 
-# Mac
+# IDE / OS specific
 .DS_Store
+.vscode/

@@ -1,4 +1,3 @@
-# File: datasets/udc_dataset.py
 import os
 import glob
 import numpy as np
@@ -11,7 +10,7 @@ class UDCDataset(Dataset):
         self.patch_size = patch_size
         self.is_train = is_train
         
-        # The data_dir is now 'data/UDC-SIT_subset/train' or '.../val'
+        # The data_dir is 'data/UDC-SIT_subset/train' or '.../val'
         self.input_files = sorted(glob.glob(os.path.join(data_dir, "input", "*.npy")))
         
         if not self.input_files:
@@ -37,16 +36,22 @@ class UDCDataset(Dataset):
         H, W, _ = udc_img.shape
         if self.is_train:
             ps = self.patch_size
-            rr = random.randint(0, H - ps)
-            rc = random.randint(0, W - ps)
-            udc_patch = udc_img[rr : rr + ps, rc : rc + ps, :]
-            gt_patch = gt_img[rr : rr + ps, rc : rc + ps, :]
+            # Ensure patch size isn't larger than image
+            ps_h = min(ps, H)
+            ps_w = min(ps, W)
+            rr = random.randint(0, H - ps_h)
+            rc = random.randint(0, W - ps_w)
+            udc_patch = udc_img[rr : rr + ps_h, rc : rc + ps_w, :]
+            gt_patch = gt_img[rr : rr + ps_h, rc : rc + ps_w, :]
         else:
+            # For validation, just take a center crop
             ps = self.patch_size
-            rr = (H - ps) // 2
-            rc = (W - ps) // 2
-            udc_patch = udc_img[rr : rr + ps, rc : rc + ps, :]
-            gt_patch = gt_img[rr : rr + ps, rc : rc + ps, :]
+            ps_h = min(ps, H)
+            ps_w = min(ps, W)
+            rr = (H - ps_h) // 2
+            rc = (W - ps_w) // 2
+            udc_patch = udc_img[rr : rr + ps_h, rc : rc + ps_w, :]
+            gt_patch = gt_img[rr : rr + ps_h, rc : rc + ps_w, :]
 
         # --- Augmentation (simple flip) ---
         if self.is_train and random.random() > 0.5:
@@ -57,8 +62,6 @@ class UDCDataset(Dataset):
         udc_tensor = torch.from_numpy(udc_patch.copy()).permute(2, 0, 1).float()
         gt_tensor = torch.from_numpy(gt_patch.copy()).permute(2, 0, 1).float()
         
-        # Normalize. Assuming LDR images [0, 255]
-        udc_tensor /= 255.0
-        gt_tensor /= 255.0
+        # NOTE: We do NOT divide by 255.0 because the dtype is float32
         
         return udc_tensor, gt_tensor

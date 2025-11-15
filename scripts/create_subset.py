@@ -1,11 +1,10 @@
-# File: scripts/create_subset.py
 import os
 import glob
 import shutil
 
 # --- Config ---
 # Source paths (where your big dataset is)
-SOURCE_DIR = "data/UDC-SIT_full/UDC-SIT"
+SOURCE_DIR = "data/UDC-SIT_full/UDC-SIT" 
 
 # Target paths (where the small subset will be)
 TARGET_DIR = "data/UDC-SIT_subset"
