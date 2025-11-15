@@ -2,12 +2,8 @@ import torch
 import torch.nn as nn
 from models.frequency_block import FrequencyDomainBlock
 
-# --- THIS IS THE FIX ---
-# We now import 'basicsr' as a top-level package,
-# because our train_teacher.py script adds it to the path.
+# This import is correct
 from basicsr.archs.mambair_arch import MambaIR as OfficialMambaIR
-# --- END FIX ---
-
 
 class FrequencyAwareTeacher(nn.Module):
     def __init__(self, in_channels=4, out_channels=3, img_size=256, 
@@ -37,7 +33,7 @@ class FrequencyAwareTeacher(nn.Module):
         # 3. A simple fusion layer
         self.freq_head = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         
-        # Fusion conv
+        # This expects 6 channels (out_channels * 2)
         self.fusion = nn.Conv2d(out_channels * 2, out_channels, kernel_size=1)
         
     def forward(self, x):
@@ -50,8 +46,11 @@ class FrequencyAwareTeacher(nn.Module):
         freq_features = self.frequency_model(x) # (B, 4, H, W)
         freq_out = self.freq_head(freq_features) # (B, 3, H, W)
         
-        # Fuse the two outputs
-        fused_features = torch.cat([spatial_out, freq_out], dim=1)
+        # --- THIS IS THE FIX ---
+        # We must concatenate freq_out (3 channels), not freq_features (4 channels)
+        fused_features = torch.cat([spatial_out, freq_out], dim=1) # (B, 6, H, W)
+        # --- END FIX ---
+
         final_out = self.fusion(fused_features)
         
         return final_out
