@@ -1,0 +1,9 @@
+torch
+torchvision
+lpips
+numpy
+matplotlib
+timm
+einops
+fvcore
+scikit-learn

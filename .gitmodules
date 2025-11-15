@@ -1,0 +1,3 @@
+[submodule "models/external/MambaIR"]
+	path = models/external/MambaIR
+	url = https://github.com/csguoh/MambaIR.git
