@@ -1,12 +1,9 @@
 import sys
 import os
 
-# --- NEW CODE: Fix for 'basicsr' ModuleNotFoundError ---
-# We must add the MambaIR submodule path to the system path
-# so that its internal 'from basicsr...' imports can work.
-
-# Get the absolute path to the directory containing this script
-project_root = os.path.dirname(os.path.abspath(__file__))
+# --- NEW ROBUST PATH FIX ---
+# Get the current working directory (which we know is the project root)
+project_root = os.getcwd()
 
 # Construct the path to the MambaIR package
 mambair_path = os.path.join(project_root, 'models', 'external', 'MambaIR')
@@ -14,7 +11,15 @@ mambair_path = os.path.join(project_root, 'models', 'external', 'MambaIR')
 # Add this path to the beginning of the sys.path
 if mambair_path not in sys.path:
     sys.path.insert(0, mambair_path)
-# --- END NEW CODE ---
+
+# --- DEBUGGING: Print the system path ---
+print("--- [DEBUG] System Path ---")
+print('\n'.join(sys.path))
+print("---------------------------")
+print(f"[DEBUG] MambaIR path added: {mambair_path}")
+print(f"[DEBUG] Does MambaIR path exist? {os.path.exists(mambair_path)}")
+print(f"[DEBUG] Does basicsr path exist? {os.path.exists(os.path.join(mambair_path, 'basicsr'))}")
+# --- END NEW FIX & DEBUG ---
 
 
 # --- Original code continues below ---
@@ -23,9 +28,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import lpips  # Make sure you pip installed this
+import lpips  
 
 from datasets.udc_dataset import UDCDataset
+# This is the line (now ~Line 30) that failed.
 from models.mambair_teacher import FrequencyAwareTeacher
 from losses.frequency_loss import FFTAmplitudeLoss
 
@@ -33,7 +39,7 @@ from losses.frequency_loss import FFTAmplitudeLoss
 TRAIN_DIR = "data/UDC-SIT_subset/train"
 VAL_DIR = "data/UDC-SIT_subset/val"
 PATCH_SIZE = 256
-BATCH_SIZE = 4  # Adjust based on Colab Pro GPU (A100/V100)
+BATCH_SIZE = 4  
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -56,7 +62,6 @@ def main():
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     # 2. Model
-    # Note: UDC-SIT paper says input is 4-channel, output is 3-channel
     model = FrequencyAwareTeacher(
         in_channels=4, 
         out_channels=3, 
