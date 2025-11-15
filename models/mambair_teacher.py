@@ -1,7 +1,7 @@
-# File: models/mambair_teacher.py
 import torch
 import torch.nn as nn
-from models.external.MambaIR.models.mambair import MambaIR as OfficialMambaIR
+# This is the line we fixed
+from models.external.MambaIR.basicsr.archs.mambair_arch import MambaIR as OfficialMambaIR
 from models.frequency_block import FrequencyDomainBlock
 
 class FrequencyAwareTeacher(nn.Module):
@@ -10,9 +10,7 @@ class FrequencyAwareTeacher(nn.Module):
         super().__init__()
         
         # 1. The main MambaIR backbone (for spatial features)
-        # We need to configure MambaIR based on its own defaults.
-        # This part requires inspecting the MambaIR repo for config.
-        # Let's assume a basic setup for restoration:
+        # This instantiation should work correctly with the new import.
         self.spatial_model = OfficialMambaIR(
             img_size=img_size,
             in_chans=in_channels,
@@ -25,7 +23,6 @@ class FrequencyAwareTeacher(nn.Module):
             ssm_dt_rank="auto",
             ssm_ratio=2.0,
             mlp_ratio=2.0,
-            # ... other MambaIR params
         )
         
         # 2. The frequency domain block (for global flare)
@@ -34,9 +31,6 @@ class FrequencyAwareTeacher(nn.Module):
         )
 
         # 3. A simple fusion layer
-        # We'll fuse the *outputs* of both branches
-        # MambaIR outputs (B, C, H, W). Freq block outputs (B, C_in, H, W)
-        # We need the Freq block output to match the target channel count (3)
         self.freq_head = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         
         # Fusion conv
@@ -55,10 +49,5 @@ class FrequencyAwareTeacher(nn.Module):
         # Fuse the two outputs
         fused_features = torch.cat([spatial_out, freq_out], dim=1)
         final_out = self.fusion(fused_features)
-        
-        # Your description also mentioned feature distillation.
-        # To enable that, you'd modify MambaIR to return intermediate
-        # features and return them here. For now, we just return the final output.
-        # For distillation, you might return: (final_out, spatial_features, freq_features)
         
         return final_out
