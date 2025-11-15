@@ -5,7 +5,7 @@ import shutil
 
 # --- Config ---
 # Source paths (where your big dataset is)
-SOURCE_DIR = "data/UDC-SIT_full/UDC-ST" 
+SOURCE_DIR = "data/UDC-SIT_full/UDC-SIT"
 
 # Target paths (where the small subset will be)
 TARGET_DIR = "data/UDC-SIT_subset"
