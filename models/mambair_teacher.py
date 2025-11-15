@@ -1,8 +1,13 @@
 import torch
 import torch.nn as nn
-# This is the line we fixed
-from models.external.MambaIR.basicsr.archs.mambair_arch import MambaIR as OfficialMambaIR
 from models.frequency_block import FrequencyDomainBlock
+
+# --- THIS IS THE FIX ---
+# We now import 'basicsr' as a top-level package,
+# because our train_teacher.py script adds it to the path.
+from basicsr.archs.mambair_arch import MambaIR as OfficialMambaIR
+# --- END FIX ---
+
 
 class FrequencyAwareTeacher(nn.Module):
     def __init__(self, in_channels=4, out_channels=3, img_size=256, 
@@ -10,7 +15,6 @@ class FrequencyAwareTeacher(nn.Module):
         super().__init__()
         
         # 1. The main MambaIR backbone (for spatial features)
-        # This instantiation should work correctly with the new import.
         self.spatial_model = OfficialMambaIR(
             img_size=img_size,
             in_chans=in_channels,
