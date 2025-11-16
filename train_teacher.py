@@ -24,14 +24,14 @@ from losses.frequency_loss import FFTAmplitudeLoss
 TRAIN_DIR = "data/UDC-SIT_subset/train"
 VAL_DIR = "data/UDC-SIT_subset/val"
 PATCH_SIZE = 256
-
-# --- THIS IS THE FIX ---
-BATCH_SIZE = 2  # Was 4, reduced to 2 to fit on GPU
-# --- END FIX ---
-
+BATCH_SIZE = 2  
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# --- NEW CHECKPOINT NAME ---
+CHECKPOINT_NAME = "teacher_10bit_normalized.pth"
+# --- END NEW NAME ---
 
 # Loss weights
 W_PIXEL = 1.0
@@ -83,6 +83,7 @@ def main():
             pred_batch = model(udc_batch)
             
             loss_pixel = pixel_loss_fn(pred_batch, gt_batch_rgb)
+            # Data is now [0, 1], so we scale to [-1, 1] for LPIPS
             loss_perceptual = perceptual_loss_fn(pred_batch * 2 - 1, gt_batch_rgb * 2 - 1).mean()
             loss_fft = fft_loss_fn(pred_batch, gt_batch_rgb)
             
@@ -117,8 +118,10 @@ def main():
         
         print(f"Epoch {epoch+1} Val L1 Loss: {val_loss / len(val_loader):.4f}")
 
-        # Save checkpoint
-        torch.save(model.state_dict(), f"teacher_epoch_{epoch+1}.pth")
+    # Save final model with new name
+    torch.save(model.state_dict(), CHECKPOINT_NAME)
+    print(f"Final model saved as {CHECKPOINT_NAME}")
+
 
 if __name__ == "__main__":
     main()

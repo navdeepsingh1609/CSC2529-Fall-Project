@@ -10,7 +10,6 @@ class UDCDataset(Dataset):
         self.patch_size = patch_size
         self.is_train = is_train
         
-        # The data_dir is 'data/UDC-SIT_subset/train' or '.../val'
         self.input_files = sorted(glob.glob(os.path.join(data_dir, "input", "*.npy")))
         
         if not self.input_files:
@@ -20,23 +19,19 @@ class UDCDataset(Dataset):
         return len(self.input_files)
 
     def __getitem__(self, idx):
-        # Load Input image
+        # Load images
         input_path = self.input_files[idx]
-        udc_img = np.load(input_path) # Shape (H, W, C)
+        udc_img = np.load(input_path)
         
-        # Find corresponding GT image
-        # It's in a parallel 'GT' folder
         gt_path = input_path.replace("/input/", "/GT/")
-        
         if not os.path.exists(gt_path):
             raise FileNotFoundError(f"Missing ground truth file: {gt_path}")
-        gt_img = np.load(gt_path) # Shape (H, W, C)
+        gt_img = np.load(gt_path)
 
-        # --- Get a random patch ---
+        # Get a random patch
         H, W, _ = udc_img.shape
         if self.is_train:
             ps = self.patch_size
-            # Ensure patch size isn't larger than image
             ps_h = min(ps, H)
             ps_w = min(ps, W)
             rr = random.randint(0, H - ps_h)
@@ -44,7 +39,6 @@ class UDCDataset(Dataset):
             udc_patch = udc_img[rr : rr + ps_h, rc : rc + ps_w, :]
             gt_patch = gt_img[rr : rr + ps_h, rc : rc + ps_w, :]
         else:
-            # For validation, just take a center crop
             ps = self.patch_size
             ps_h = min(ps, H)
             ps_w = min(ps, W)
@@ -53,15 +47,18 @@ class UDCDataset(Dataset):
             udc_patch = udc_img[rr : rr + ps_h, rc : rc + ps_w, :]
             gt_patch = gt_img[rr : rr + ps_h, rc : rc + ps_w, :]
 
-        # --- Augmentation (simple flip) ---
         if self.is_train and random.random() > 0.5:
             udc_patch = np.fliplr(udc_patch)
             gt_patch = np.fliplr(gt_patch)
 
-        # Convert to PyTorch tensor (H, W, C) -> (C, H, W)
+        # Convert to tensor
         udc_tensor = torch.from_numpy(udc_patch.copy()).permute(2, 0, 1).float()
         gt_tensor = torch.from_numpy(gt_patch.copy()).permute(2, 0, 1).float()
         
-        # NOTE: We do NOT divide by 255.0 because the dtype is float32
+        # --- THIS IS THE FIX ---
+        # Normalize the 10-bit [0, 1023] data to the [0, 1] range
+        udc_tensor /= 1023.0
+        gt_tensor /= 1023.0
+        # --- END FIX ---
         
         return udc_tensor, gt_tensor
