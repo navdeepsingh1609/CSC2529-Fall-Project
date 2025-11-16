@@ -14,6 +14,8 @@ class UDCDataset(Dataset):
         
         if not self.input_files:
             raise FileNotFoundError(f"No .npy files found in {os.path.join(data_dir, 'input')}")
+        
+        print(f"--- [UDCDataset] Loaded {len(self.input_files)} files from {data_dir}")
 
     def __len__(self):
         return len(self.input_files)
@@ -55,10 +57,8 @@ class UDCDataset(Dataset):
         udc_tensor = torch.from_numpy(udc_patch.copy()).permute(2, 0, 1).float()
         gt_tensor = torch.from_numpy(gt_patch.copy()).permute(2, 0, 1).float()
         
-        # --- THIS IS THE FIX ---
         # Normalize the 10-bit [0, 1023] data to the [0, 1] range
         udc_tensor /= 1023.0
         gt_tensor /= 1023.0
-        # --- END FIX ---
         
         return udc_tensor, gt_tensor
