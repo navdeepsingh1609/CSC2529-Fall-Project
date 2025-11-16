@@ -1,28 +1,14 @@
 import sys
 import os
 
-# --- NEW ROBUST PATH FIX ---
-# Get the current working directory (which we know is the project root)
+# --- Path fix (this is correct) ---
 project_root = os.getcwd()
-
-# Construct the path to the MambaIR package
 mambair_path = os.path.join(project_root, 'models', 'external', 'MambaIR')
-
-# Add this path to the beginning of the sys.path
 if mambair_path not in sys.path:
     sys.path.insert(0, mambair_path)
-
-# --- DEBUGGING: Print the system path ---
-print("--- [DEBUG] System Path ---")
-print('\n'.join(sys.path))
-print("---------------------------")
-print(f"[DEBUG] MambaIR path added: {mambair_path}")
-print(f"[DEBUG] Does MambaIR path exist? {os.path.exists(mambair_path)}")
-print(f"[DEBUG] Does basicsr path exist? {os.path.exists(os.path.join(mambair_path, 'basicsr'))}")
-# --- END NEW FIX & DEBUG ---
+# --- End path fix ---
 
 
-# --- Original code continues below ---
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -31,7 +17,6 @@ from tqdm import tqdm
 import lpips  
 
 from datasets.udc_dataset import UDCDataset
-# This is the line (now ~Line 30) that failed.
 from models.mambair_teacher import FrequencyAwareTeacher
 from losses.frequency_loss import FFTAmplitudeLoss
 
@@ -39,7 +24,11 @@ from losses.frequency_loss import FFTAmplitudeLoss
 TRAIN_DIR = "data/UDC-SIT_subset/train"
 VAL_DIR = "data/UDC-SIT_subset/val"
 PATCH_SIZE = 256
-BATCH_SIZE = 4  
+
+# --- THIS IS THE FIX ---
+BATCH_SIZE = 2  # Was 4, reduced to 2 to fit on GPU
+# --- END FIX ---
+
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -86,19 +75,14 @@ def main():
             udc_batch = udc_batch.to(DEVICE)
             gt_batch = gt_batch.to(DEVICE) 
 
-            # Check if GT is 4-channel and select RGB
             if gt_batch.shape[1] == 4:
                 gt_batch_rgb = gt_batch[:, :3, :, :]
             else:
                 gt_batch_rgb = gt_batch
 
-            # Forward pass
             pred_batch = model(udc_batch)
             
-            # Compute losses
             loss_pixel = pixel_loss_fn(pred_batch, gt_batch_rgb)
-            # LPIPS expects input in range [-1, 1], our data is [0, 1]
-            # We scale it: (x * 2) - 1
             loss_perceptual = perceptual_loss_fn(pred_batch * 2 - 1, gt_batch_rgb * 2 - 1).mean()
             loss_fft = fft_loss_fn(pred_batch, gt_batch_rgb)
             
@@ -106,7 +90,6 @@ def main():
                          (W_PERCEPTUAL * loss_perceptual) + \
                          (W_FFT * loss_fft)
             
-            # Backward pass
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -115,7 +98,7 @@ def main():
         
         print(f"Epoch {epoch+1} Train Loss: {train_loss / len(train_loader):.4f}")
         
-        # --- Validation Loop (Recommended) ---
+        # --- Validation Loop ---
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -130,7 +113,7 @@ def main():
                 pred_batch = model(udc_batch)
                 
                 loss_pixel = pixel_loss_fn(pred_batch, gt_batch_rgb)
-                val_loss += loss_pixel.item() # Just use L1 for val for speed
+                val_loss += loss_pixel.item()
         
         print(f"Epoch {epoch+1} Val L1 Loss: {val_loss / len(val_loader):.4f}")
 
