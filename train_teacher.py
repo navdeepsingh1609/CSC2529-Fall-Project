@@ -29,9 +29,9 @@ LEARNING_RATE = 1e-4
 NUM_EPOCHS = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- NEW CHECKPOINT NAME ---
+# --- Checkpoint name (from 10-bit) ---
 CHECKPOINT_NAME = "teacher_10bit_normalized.pth"
-# --- END NEW NAME ---
+# ---
 
 # Loss weights
 W_PIXEL = 1.0
@@ -41,6 +41,7 @@ W_FFT = 0.05
 
 def main():
     # 1. DataLoaders
+    # Using 10-bit normalization (divide by 1023.0)
     train_dataset = UDCDataset(TRAIN_DIR, patch_size=PATCH_SIZE, is_train=True)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
     
@@ -80,10 +81,14 @@ def main():
             else:
                 gt_batch_rgb = gt_batch
 
-            pred_batch = model(udc_batch)
+            # --- THIS IS THE FIX ---
+            # Unpack the tuple: (final_image, feature_map)
+            pred_batch, _ = model(udc_batch) 
+            # --- END FIX ---
             
+            # Compute losses
             loss_pixel = pixel_loss_fn(pred_batch, gt_batch_rgb)
-            # Data is now [0, 1], so we scale to [-1, 1] for LPIPS
+            # Data is [0, 1], so we scale to [-1, 1] for LPIPS
             loss_perceptual = perceptual_loss_fn(pred_batch * 2 - 1, gt_batch_rgb * 2 - 1).mean()
             loss_fft = fft_loss_fn(pred_batch, gt_batch_rgb)
             
@@ -91,6 +96,7 @@ def main():
                          (W_PERCEPTUAL * loss_perceptual) + \
                          (W_FFT * loss_fft)
             
+            # Backward pass
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -105,13 +111,10 @@ def main():
         with torch.no_grad():
             for udc_batch, gt_batch in val_loader:
                 udc_batch = udc_batch.to(DEVICE)
-                gt_batch = gt_batch.to(DEVICE)
-                if gt_batch.shape[1] == 4:
-                    gt_batch_rgb = gt_batch[:, :3, :, :]
-                else:
-                    gt_batch_rgb = gt_batch
+                gt_batch_rgb = gt_batch[:, :3, :, :].to(DEVICE)
                 
-                pred_batch = model(udc_batch)
+                # Also unpack here for validation
+                pred_batch, _ = model(udc_batch)
                 
                 loss_pixel = pixel_loss_fn(pred_batch, gt_batch_rgb)
                 val_loss += loss_pixel.item()
