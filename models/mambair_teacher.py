@@ -51,6 +51,17 @@ class FrequencyAwareTeacher(nn.Module):
         fused_features = torch.cat([spatial_out, freq_out], dim=1) # (B, 6, H, W)
         # --- END FIX ---
 
+        # --- [DEBUG] PRINTING SHAPES ---
+        # Let's print the shapes right before the fusion layer that crashes.
+        # This will prove if the fix is working.
+        print("\n--- [DEBUG] SHAPES ---")
+        print(f"spatial_out shape: {spatial_out.shape}")
+        print(f"freq_features shape: {freq_features.shape}  <-- This should be 4 channels")
+        print(f"freq_out shape: {freq_out.shape}      <-- This should be 3 channels")
+        print(f"fused_features shape: {fused_features.shape}  <-- This MUST be 6 channels")
+        print("----------------------\n")
+        # --- END DEBUG ---
+
         final_out = self.fusion(fused_features)
         
         return final_out
