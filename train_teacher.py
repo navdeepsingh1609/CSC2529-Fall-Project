@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast # <-- Corrected import location
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import lpips  
 
@@ -21,12 +21,12 @@ from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
 from losses.frequency_loss import FFTAmplitudeLoss
 
-# --- CONFIGURATION (Reading from GDrive) ---
+# --- [FIX] CONFIG FOR GDRIVE ---
 TRAIN_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT/training"
 VAL_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT/validation"
 PATCH_SIZE = 256
-BATCH_SIZE = 32 # This is fine for your 80GB GPU
-# --- [END CONFIG] ---
+BATCH_SIZE = 8 # <-- REDUCED from 32
+# --- [END FIX] ---
 
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 50
@@ -54,14 +54,13 @@ def main():
     train_dataset = UDCDataset(TRAIN_DIR, patch_size=PATCH_SIZE, is_train=True)
     
     # --- [THE FIX] ---
-    # Reduced num_workers from 8 to 2 (or 0) for Google Drive.
-    # Set pin_memory to False, as it's not helpful with slow I/O.
+    # Set num_workers=0 to stop parallel hangs on Google Drive.
     train_loader = DataLoader(
         train_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=2,  # <-- REDUCED from 8
-        pin_memory=False # <-- SET to False
+        num_workers=0,  # <-- CRITICAL FIX
+        pin_memory=False
     )
     # --- [END FIX] ---
     
@@ -70,8 +69,8 @@ def main():
         val_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=False, 
-        num_workers=2, # <-- REDUCED from 8
-        pin_memory=False # <-- SET to False
+        num_workers=0, # <-- CRITICAL FIX
+        pin_memory=False
     )
 
     print(f"--- [train_teacher] Device: {DEVICE}")
@@ -90,9 +89,8 @@ def main():
     # 4. Optimizer
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
-    # 5. --- [FIX] Correct GradScaler initialization ---
+    # 5. AMP Scaler (Corrected syntax)
     scaler = torch.amp.GradScaler('cuda')
-    # --- [END FIX] ---
 
     print("--- [train_teacher] Starting training...")
 
@@ -100,12 +98,12 @@ def main():
         model.train()
         train_loss = 0.0
         
-        # The first time you run this, it will be slow as it loads the first batch
+        # This will now be slow to start, but it should not hang.
         for udc_batch, gt_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             udc_batch = udc_batch.to(DEVICE, non_blocking=True)
             gt_batch = gt_batch.to(DEVICE, non_blocking=True) 
 
-            optimizer.zero_grad(set_to_none=True) # Better performance
+            optimizer.zero_grad(set_to_none=True)
 
             with autocast():
                 pred_batch_4ch, _, _ = model(udc_batch) 
