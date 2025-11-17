@@ -3,8 +3,9 @@ import glob
 import shutil
 
 # --- Config ---
-# Source paths (where your big dataset is)
-SOURCE_DIR = "data/UDC-SIT_full/UDC-SIT" 
+# --- [FIX] Point SOURCE_DIR to the extracted dataset location ---
+SOURCE_DIR = "/content/dataset/UDC-SIT" 
+# --- [END FIX] ---
 
 # Target paths (where the small subset will be)
 TARGET_DIR = "data/UDC-SIT_subset"
