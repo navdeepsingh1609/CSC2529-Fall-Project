@@ -21,11 +21,11 @@ from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
 from losses.frequency_loss import FFTAmplitudeLoss
 
-# --- [FIX] CONFIG FOR GDRIVE ---
-TRAIN_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT/training"
-VAL_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT/validation"
+# --- [FIX] CONFIG FOR FAST LOCAL DISK ---
+TRAIN_DIR = "/content/dataset/UDC-SIT/training" # <-- FAST PATH
+VAL_DIR = "/content/dataset/UDC-SIT/validation" # <-- FAST PATH
 PATCH_SIZE = 256
-BATCH_SIZE = 8 # <-- REDUCED from 32
+BATCH_SIZE = 8 # <-- Your 64GB RAM usage shows this is a good size
 # --- [END FIX] ---
 
 LEARNING_RATE = 1e-4
@@ -54,13 +54,13 @@ def main():
     train_dataset = UDCDataset(TRAIN_DIR, patch_size=PATCH_SIZE, is_train=True)
     
     # --- [THE FIX] ---
-    # Set num_workers=0 to stop parallel hangs on Google Drive.
+    # Re-enable high-speed settings for local disk
     train_loader = DataLoader(
         train_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        num_workers=0,  # <-- CRITICAL FIX
-        pin_memory=False
+        num_workers=8,  # <-- Re-enabled for fast loading
+        pin_memory=True # <-- Re-enabled
     )
     # --- [END FIX] ---
     
@@ -69,8 +69,8 @@ def main():
         val_dataset, 
         batch_size=BATCH_SIZE, 
         shuffle=False, 
-        num_workers=0, # <-- CRITICAL FIX
-        pin_memory=False
+        num_workers=8, # <-- Re-enabled
+        pin_memory=True # <-- Re-enabled
     )
 
     print(f"--- [train_teacher] Device: {DEVICE}")
@@ -89,7 +89,7 @@ def main():
     # 4. Optimizer
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
-    # 5. AMP Scaler (Corrected syntax)
+    # 5. AMP Scaler
     scaler = torch.amp.GradScaler('cuda')
 
     print("--- [train_teacher] Starting training...")
@@ -98,7 +98,6 @@ def main():
         model.train()
         train_loss = 0.0
         
-        # This will now be slow to start, but it should not hang.
         for udc_batch, gt_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             udc_batch = udc_batch.to(DEVICE, non_blocking=True)
             gt_batch = gt_batch.to(DEVICE, non_blocking=True) 
