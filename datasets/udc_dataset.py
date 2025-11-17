@@ -37,23 +37,18 @@ class UDCDataset(Dataset):
 
         # 2. Get random top-left corner
         if self.is_train:
-            # Random crop for W (dim 0)
-            rc = random.randint(0, W - ps) 
-            # Random crop for H (dim 1)
-            rr = random.randint(0, H - ps) 
+            rc = random.randint(0, W - ps) # Random crop for W (dim 0)
+            rr = random.randint(0, H - ps) # Random crop for H (dim 1)
         else:
             # Center crop
             rc = (W - ps) // 2
             rr = (H - ps) // 2
 
-        # 3. Crop the patch
-        # Numpy cropping is [dim0, dim1], so [W_crop, H_crop]
+        # 3. Crop the patch (W_crop, H_crop, C)
         udc_patch = udc_img[rc : rc + ps, rr : rr + ps, :]
         gt_patch = gt_img[rc : rc + ps, rr : rr + ps, :]
-        # udc_patch shape is (patch_W, patch_H, C) = (256, 256, 4)
         # --- [END FIX] ---
         
-        # --- Augmentation (unchanged) ---
         if self.is_train and random.random() > 0.5:
             udc_patch = np.fliplr(udc_patch)
             gt_patch = np.fliplr(gt_patch)
@@ -66,9 +61,8 @@ class UDCDataset(Dataset):
         gt_tensor = torch.from_numpy(gt_patch.copy()).permute(2, 1, 0).float()
         # --- [END FIX] ---
 
-        # Normalize (unchanged, still correct)
+        # Normalize
         udc_tensor /= 1023.0
         gt_tensor /= 1023.0
         
-        # Final tensor shape is (4, 256, 256) in (C, H, W) order
         return udc_tensor, gt_tensor
