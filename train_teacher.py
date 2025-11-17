@@ -21,17 +21,17 @@ from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
 from losses.frequency_loss import FFTAmplitudeLoss
 
-# --- [FIX] CONFIG FOR 4-HOUR BUDGET ---
+# --- [FIX] CONFIG FOR 4-HOUR BUDGET (BS=10) ---
 TRAIN_DIR = "/content/dataset/UDC-SIT/training" 
 VAL_DIR = "/content/dataset/UDC-SIT/validation" 
 PATCH_SIZE = 256
-BATCH_SIZE = 8 # (Cannot increase, GPU is full)
-NUM_EPOCHS = 24 # <-- REDUCED from 50 to fit 4-hour budget
+BATCH_SIZE = 10 # <-- UPDATED from 8
+NUM_EPOCHS = 34 # <-- UPDATED from 50/24
 # --- [END FIX] ---
 
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CHECKPOINT_NAME = "teacher_4ch_24_epochs.pth" # New name
+CHECKPOINT_NAME = "teacher_4ch_34_epochs.pth" # New name
 
 # Loss weights
 W_PIXEL = 1.0
@@ -86,6 +86,7 @@ def main():
         model.train()
         train_loss = 0.0
         
+        # This loop will now have 187 steps
         for udc_batch, gt_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             udc_batch = udc_batch.to(DEVICE, non_blocking=True)
             gt_batch = gt_batch.to(DEVICE, non_blocking=True) 
@@ -93,7 +94,6 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             # --- [FIX for 'nan' loss] ---
-            # Run the model and spatial losses in mixed precision
             with autocast():
                 pred_batch_4ch, _, _ = model(udc_batch) 
                 loss_pixel = pixel_loss_fn(pred_batch_4ch, gt_batch)
@@ -101,7 +101,6 @@ def main():
                 gt_rgb_slice = gt_batch[:, :3, :, :]
                 loss_perceptual = perceptual_loss_fn(pred_rgb_slice * 2 - 1, gt_rgb_slice * 2 - 1).mean()
             
-            # Run the FFT loss in full float32
             loss_fft = fft_loss_fn(pred_batch_4ch.float(), gt_batch.float())
             # --- [END FIX] ---
                 
