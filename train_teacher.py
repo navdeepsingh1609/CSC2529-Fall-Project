@@ -21,23 +21,35 @@ from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
 from losses.frequency_loss import FFTAmplitudeLoss
 
-# --- Config (unchanged) ---
-TRAIN_DIR = "/content/dataset/UDC-SIT/training"
-VAL_DIR = "/content/dataset/UDC-SIT/validation"
+# --- [FIX] CONFIG FOR 4-HOUR BUDGET ---
+TRAIN_DIR = "/content/dataset/UDC-SIT/training" 
+VAL_DIR = "/content/dataset/UDC-SIT/validation" 
 PATCH_SIZE = 256
-BATCH_SIZE = 8
+BATCH_SIZE = 8 # (Cannot increase, GPU is full)
+NUM_EPOCHS = 24 # <-- REDUCED from 50 to fit 4-hour budget
+# --- [END FIX] ---
+
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CHECKPOINT_NAME = "teacher_4ch_FULL_DATASET.pth" 
+CHECKPOINT_NAME = "teacher_4ch_24_epochs.pth" # New name
+
+# Loss weights
 W_PIXEL = 1.0
 W_PERCEPTUAL = 0.1
 W_FFT = 0.05
-# ... (Print statements omitted for brevity) ...
+
+print("\n--- [train_teacher] Configuration ---")
+print(f"Train Dir: {TRAIN_DIR}")
+print(f"Val Dir: {VAL_DIR}")
+print(f"Patch Size: {PATCH_SIZE}, Batch Size: {BATCH_SIZE}")
+print(f"Epochs: {NUM_EPOCHS}, Learning Rate: {LEARNING_RATE}")
+print(f"Device: {DEVICE}")
+print(f"Checkpoint Name: {CHECKPOINT_NAME}")
+print("-----------------------------------\n")
 # --------------
 
 def main():
-    # 1. DataLoaders (unchanged)
+    # 1. DataLoaders (unchanged, still high-speed)
     print("--- [train_teacher] Loading datasets...")
     train_dataset = UDCDataset(TRAIN_DIR, patch_size=PATCH_SIZE, is_train=True)
     train_loader = DataLoader(
@@ -80,23 +92,18 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            # --- [THE FIX (Part 1)] ---
+            # --- [FIX for 'nan' loss] ---
             # Run the model and spatial losses in mixed precision
             with autocast():
                 pred_batch_4ch, _, _ = model(udc_batch) 
-                
                 loss_pixel = pixel_loss_fn(pred_batch_4ch, gt_batch)
-                
                 pred_rgb_slice = pred_batch_4ch[:, :3, :, :]
                 gt_rgb_slice = gt_batch[:, :3, :, :]
                 loss_perceptual = perceptual_loss_fn(pred_rgb_slice * 2 - 1, gt_rgb_slice * 2 - 1).mean()
-            # --- [END FIX (Part 1)] ---
-
-            # --- [THE FIX (Part 2)] ---
+            
             # Run the FFT loss in full float32
-            # by moving it OUTSIDE the autocast block
             loss_fft = fft_loss_fn(pred_batch_4ch.float(), gt_batch.float())
-            # --- [END FIX (Part 2)] ---
+            # --- [END FIX] ---
                 
             total_loss = (W_PIXEL * loss_pixel) + \
                          (W_PERCEPTUAL * loss_perceptual) + \
