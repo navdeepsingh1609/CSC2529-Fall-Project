@@ -21,17 +21,17 @@ from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
 from losses.frequency_loss import FFTAmplitudeLoss
 
-# --- [FIX] CONFIG FOR 4-HOUR BUDGET (BS=10) ---
+# --- [FIX] CONFIG FOR 4-HOUR BUDGET (BS=9) ---
 TRAIN_DIR = "/content/dataset/UDC-SIT/training" 
 VAL_DIR = "/content/dataset/UDC-SIT/validation" 
 PATCH_SIZE = 256
-BATCH_SIZE = 10 # <-- UPDATED from 8
-NUM_EPOCHS = 34 # <-- UPDATED from 50/24
+BATCH_SIZE = 9  # <-- UPDATED to 9
+NUM_EPOCHS = 26 # <-- UPDATED to 26
 # --- [END FIX] ---
 
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CHECKPOINT_NAME = "teacher_4ch_34_epochs.pth" # New name
+CHECKPOINT_NAME = "teacher_4ch_26_epochs_bs9.pth" # New name
 
 # Loss weights
 W_PIXEL = 1.0
@@ -86,7 +86,7 @@ def main():
         model.train()
         train_loss = 0.0
         
-        # This loop will now have 187 steps
+        # This loop will now have ~208 steps
         for udc_batch, gt_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
             udc_batch = udc_batch.to(DEVICE, non_blocking=True)
             gt_batch = gt_batch.to(DEVICE, non_blocking=True) 
