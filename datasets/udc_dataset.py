@@ -21,7 +21,8 @@ class UDCDataset(Dataset):
         return len(self.input_files)
 
     def __getitem__(self, idx):
-        # Load images
+        # --- [THE FIX] ---
+        # Load images. Shape is (W, H, C) = (1792, 1280, 4)
         input_path = self.input_files[idx]
         udc_img = np.load(input_path)
         
@@ -30,35 +31,44 @@ class UDCDataset(Dataset):
             raise FileNotFoundError(f"Missing ground truth file: {gt_path}")
         gt_img = np.load(gt_path)
 
-        # Get a random patch
-        H, W, _ = udc_img.shape
-        if self.is_train:
-            ps = self.patch_size
-            ps_h = min(ps, H)
-            ps_w = min(ps, W)
-            rr = random.randint(0, H - ps_h)
-            rc = random.randint(0, W - ps_w)
-            udc_patch = udc_img[rr : rr + ps_h, rc : rc + ps_w, :]
-            gt_patch = gt_img[rr : rr + ps_h, rc : rc + ps_w, :]
-        else:
-            ps = self.patch_size
-            ps_h = min(ps, H)
-            ps_w = min(ps, W)
-            rr = (H - ps_h) // 2
-            rc = (W - ps_w) // 2
-            udc_patch = udc_img[rr : rr + ps_h, rc : rc + ps_w, :]
-            gt_patch = gt_img[rr : rr + ps_h, rc : rc + ps_w, :]
+        # 1. Correctly get dimensions
+        W, H, _ = udc_img.shape # W = 1792, H = 1280
+        ps = self.patch_size
 
+        # 2. Get random top-left corner
+        if self.is_train:
+            # Random crop for W (dim 0)
+            rc = random.randint(0, W - ps) 
+            # Random crop for H (dim 1)
+            rr = random.randint(0, H - ps) 
+        else:
+            # Center crop
+            rc = (W - ps) // 2
+            rr = (H - ps) // 2
+
+        # 3. Crop the patch
+        # Numpy cropping is [dim0, dim1], so [W_crop, H_crop]
+        udc_patch = udc_img[rc : rc + ps, rr : rr + ps, :]
+        gt_patch = gt_img[rc : rc + ps, rr : rr + ps, :]
+        # udc_patch shape is (patch_W, patch_H, C) = (256, 256, 4)
+        # --- [END FIX] ---
+        
+        # --- Augmentation (unchanged) ---
         if self.is_train and random.random() > 0.5:
             udc_patch = np.fliplr(udc_patch)
             gt_patch = np.fliplr(gt_patch)
 
-        # Convert to tensor
-        udc_tensor = torch.from_numpy(udc_patch.copy()).permute(2, 0, 1).float()
-        gt_tensor = torch.from_numpy(gt_patch.copy()).permute(2, 0, 1).float()
-        
-        # Normalize the 10-bit [0, 1023] data to the [0, 1] range
+        # --- [THE FIX] ---
+        # 4. Correctly permute (W, H, C) to (C, H, W)
+        # We need to map (0, 1, 2) -> (2, 1, 0)
+        # (patch_W, patch_H, C) -> (C, patch_H, patch_W)
+        udc_tensor = torch.from_numpy(udc_patch.copy()).permute(2, 1, 0).float()
+        gt_tensor = torch.from_numpy(gt_patch.copy()).permute(2, 1, 0).float()
+        # --- [END FIX] ---
+
+        # Normalize (unchanged, still correct)
         udc_tensor /= 1023.0
         gt_tensor /= 1023.0
         
+        # Final tensor shape is (4, 256, 256) in (C, H, W) order
         return udc_tensor, gt_tensor
