@@ -44,13 +44,13 @@ class UDCDataset(Dataset):
             rc = (W - ps) // 2
             rr = (H - ps) // 2
 
-        # 3. Crop the patch (W_crop, H_crop, C)
+        # 3. Crop the patch (W_patch, H_patch, C)
         udc_patch = udc_img[rc : rc + ps, rr : rr + ps, :]
         gt_patch = gt_img[rc : rc + ps, rr : rr + ps, :]
         # --- [END FIX] ---
         
         if self.is_train and random.random() > 0.5:
-            udc_patch = np.fliplr(udc_patch)
+            udc_patch = np.fliplr(udc_patch) # Flips Left/Right (on H-axis, which is dim 1)
             gt_patch = np.fliplr(gt_patch)
 
         # --- [THE FIX] ---
