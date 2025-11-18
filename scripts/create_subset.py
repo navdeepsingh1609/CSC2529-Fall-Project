@@ -4,7 +4,7 @@ import shutil
 
 # --- Config ---
 # --- [FIX] Point SOURCE_DIR to the extracted dataset location ---
-SOURCE_DIR = "/content/dataset/UDC-SIT" 
+SOURCE_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT" 
 # --- [END FIX] ---
 
 # Target paths (where the small subset will be)
