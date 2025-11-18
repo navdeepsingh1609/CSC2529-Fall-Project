@@ -1,6 +1,7 @@
 # File: train_student_kd.py
 import sys
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,8 +10,8 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import lpips
+import matplotlib.pyplot as plt
 
-# Speed vs reproducibility: favour speed
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
@@ -33,16 +34,13 @@ VAL_DIR   = "/content/dataset/UDC-SIT/validation"
 
 PATCH_SIZE = 256
 
-BATCH_SIZE = 64          # you confirmed 64 fits for student on A100
+BATCH_SIZE    = 64          # you verified this fits for student
 LEARNING_RATE = 2e-4
-NUM_EPOCHS = 20          # good full run; can drop to ~14 for budget
+NUM_EPOCHS    = 20          # adjust if needed
+DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TEACHER_WEIGHTS = "teacher_4ch_22epochs_bs8.pth"
 
-# Teacher checkpoint (trained by train_teacher.py)
-TEACHER_WEIGHTS = "teacher_4ch_22epochs_bs8.pth"  # or your existing teacher
-
-# Student checkpoints
 LOCAL_LATEST_STUDENT = "student_4ch_latest.pth"
 FINAL_STUDENT_NAME   = "student_distilled_4ch_full_data.pth"
 
@@ -51,9 +49,15 @@ os.makedirs(DRIVE_CHECKPOINT_DIR, exist_ok=True)
 DRIVE_LATEST_STUDENT = os.path.join(DRIVE_CHECKPOINT_DIR, "student_latest.pth")
 DRIVE_BEST_STUDENT   = os.path.join(DRIVE_CHECKPOINT_DIR, "student_best.pth")
 
+# Loss history paths
+LOCAL_LOSS_HISTORY = "student_loss_history_full.npz"
+DRIVE_LOSS_HISTORY = os.path.join(DRIVE_CHECKPOINT_DIR, "student_loss_history_full.npz")
+LOSS_PLOT_PNG      = "student_loss_curves_full.png"
+DRIVE_LOSS_PLOT    = os.path.join(DRIVE_CHECKPOINT_DIR, "student_loss_curves_full.png")
+
 # Loss weights
 W_PIXEL   = 1.0
-W_FEATURE = 0.5    # combined spatial + freq feature KD
+W_FEATURE = 0.5    # spatial + freq KD
 W_FREQ    = 0.2    # output-level freq KD
 W_LPIPS   = 0.1
 # --------------------------------------
@@ -108,7 +112,7 @@ def main():
     # 4. Losses
     print("--- [train_student_kd] Initializing losses...")
     pixel_loss_fn     = CharbonnierLoss().to(DEVICE)
-    feature_loss_fn   = nn.L1Loss().to(DEVICE)   # spatial KD
+    feature_loss_fn   = nn.L1Loss().to(DEVICE)
     frequency_loss_fn = FFTAmplitudeLoss(
         loss_weight=1.0,
         focus_low_freq=True,
@@ -122,12 +126,15 @@ def main():
         optimizer, T_max=NUM_EPOCHS
     )
 
-    # 6. AMP scaler  ✅ FIXED: no 'cuda' argument
+    # 6. AMP scaler
     scaler = GradScaler()
 
-    print("--- [train_student_kd] Starting Knowledge Distillation training...")
+    # 7. Loss histories
+    train_loss_history = []
+    val_loss_history   = []
+    best_val_loss      = float("inf")
 
-    best_val_loss = float("inf")
+    print("--- [train_student_kd] Starting Knowledge Distillation training...")
 
     for epoch in range(NUM_EPOCHS):
         student.train()
@@ -139,16 +146,16 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            # ---- Teacher forward (no grad) ----
+            # Teacher forward (no grad)
             with torch.no_grad():
                 with autocast():
                     teacher_out_4ch, teacher_feat_spatial, _ = teacher(udc_batch)
 
-            # ---- Student forward + main losses ----
+            # Student forward
             with autocast():
                 student_out_4ch, student_features_raw = student(udc_batch)
 
-                # 1) Pixel loss (Charbonnier)
+                # 1) Pixel loss
                 loss_pixel = pixel_loss_fn(student_out_4ch, gt_batch)
 
                 # 2) Spatial feature KD
@@ -160,7 +167,7 @@ def main():
                 )
                 loss_feature_spatial = feature_loss_fn(student_features, teacher_feat_spatial)
 
-                # 3) LPIPS (pseudo-RGB)
+                # 3) LPIPS
                 pred_rgb_slice = student_out_4ch[:, :3, :, :]
                 gt_rgb_slice   = gt_batch[:, :3, :, :]
                 loss_lpips = perceptual_loss_fn(
@@ -168,24 +175,19 @@ def main():
                     gt_rgb_slice   * 2 - 1
                 ).mean()
 
-            # ---- Frequency-based KD (float32) ----
-            # (a) Output-level frequency KD: student vs teacher output
+            # 4) Frequency-based KD (float32)
             loss_freq_out = frequency_loss_fn(
                 student_out_4ch.float(),
                 teacher_out_4ch.float()
             )
-
-            # (b) Feature-level frequency KD: student vs teacher spatial features
             loss_feature_freq = frequency_loss_fn(
                 student_features.float(),
                 teacher_feat_spatial.float()
             )
 
-            # Combine spatial + frequency feature KD (this is your novel KD idea)
             loss_feature = 0.5 * loss_feature_spatial + 0.5 * loss_feature_freq
             loss_freq    = loss_freq_out
 
-            # ---- Total loss ----
             total_loss = (W_PIXEL   * loss_pixel)   + \
                          (W_FEATURE * loss_feature) + \
                          (W_FREQ    * loss_freq)    + \
@@ -200,7 +202,7 @@ def main():
         avg_train_loss = train_loss / len(train_loader)
         print(f"--- [train_student_kd] Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
 
-        # ---- Validation ----
+        # Validation
         student.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -219,20 +221,59 @@ def main():
 
         scheduler.step()
 
-        # ---- Save checkpoints (local + Drive) ----
+        # Record histories
+        train_loss_history.append(avg_train_loss)
+        val_loss_history.append(avg_val_loss)
+
+        # Save latest checkpoints
         torch.save(student.state_dict(), LOCAL_LATEST_STUDENT)
         torch.save(student.state_dict(), DRIVE_LATEST_STUDENT)
         print(f"Saved latest student checkpoint to {LOCAL_LATEST_STUDENT} and {DRIVE_LATEST_STUDENT}")
 
+        # Save best
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(student.state_dict(), DRIVE_BEST_STUDENT)
             print(f"New best val loss. Saved best student checkpoint to {DRIVE_BEST_STUDENT}")
 
-    # Save final named checkpoint locally + to Drive
+        # Save loss history each epoch
+        np.savez(
+            LOCAL_LOSS_HISTORY,
+            train_loss=np.array(train_loss_history, dtype=np.float32),
+            val_loss=np.array(val_loss_history, dtype=np.float32),
+        )
+        np.savez(
+            DRIVE_LOSS_HISTORY,
+            train_loss=np.array(train_loss_history, dtype=np.float32),
+            val_loss=np.array(val_loss_history, dtype=np.float32),
+        )
+
+    # Final named checkpoint
     torch.save(student.state_dict(), FINAL_STUDENT_NAME)
     torch.save(student.state_dict(), os.path.join(DRIVE_CHECKPOINT_DIR, FINAL_STUDENT_NAME))
     print(f"--- [train_student_kd] Final student saved as {FINAL_STUDENT_NAME} locally and on Drive")
+
+    # Final loss curves plot
+    epochs = np.arange(1, len(train_loss_history) + 1)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(epochs, train_loss_history, label="Train")
+    ax.plot(epochs, val_loss_history,   label="Val")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss (KD total: pixel + feat + freq + LPIPS)")
+    ax.set_title("Student KD Training & Validation Loss")
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(LOSS_PLOT_PNG, dpi=150)
+    plt.close(fig)
+
+    # Copy plot to Drive
+    try:
+        import shutil
+        shutil.copy(LOSS_PLOT_PNG, DRIVE_LOSS_PLOT)
+        print(f"Saved loss curves plot to {LOSS_PLOT_PNG} and {DRIVE_LOSS_PLOT}")
+    except Exception as e:
+        print(f"Could not copy loss plot to Drive: {e}")
 
 if __name__ == "__main__":
     main()

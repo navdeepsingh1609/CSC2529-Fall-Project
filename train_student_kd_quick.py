@@ -1,6 +1,7 @@
 # File: train_student_kd_quick.py
 import sys
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +10,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import lpips
+import matplotlib.pyplot as plt
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
@@ -26,26 +28,28 @@ from models.unet_student import UNetStudent
 from losses.frequency_loss import FFTAmplitudeLoss
 from losses.pixel_loss import CharbonnierLoss
 
-# ---------------- CONFIG (quick subset) ----------------
+# ---------------- CONFIG (subset) ----------------
 TRAIN_DIR = "data/UDC-SIT_subset/train"
 VAL_DIR   = "data/UDC-SIT_subset/val"
 
 PATCH_SIZE = 256
-BATCH_SIZE = 16        # good for a quick sanity run
+BATCH_SIZE = 16
 LEARNING_RATE = 2e-4
-NUM_EPOCHS = 1         # just to test pipeline
-
+NUM_EPOCHS = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-TEACHER_WEIGHTS = "teacher_quick_1epoch.pth"
+TEACHER_WEIGHTS   = "teacher_quick_1epoch.pth"
 STUDENT_SAVE_PATH = "student_quick_1epoch.pth"
+
+LOSS_HISTORY_FILE = "student_quick_loss_history.npz"
+LOSS_PLOT_PNG     = "student_quick_loss_curves.png"
 
 # Loss weights
 W_PIXEL   = 1.0
 W_FEATURE = 0.5
 W_FREQ    = 0.2
 W_LPIPS   = 0.1
-# ------------------------------------------------------
+# ------------------------------------------------
 
 print("\n--- [train_student_kd_quick] Configuration ---")
 print(f"Train Dir: {TRAIN_DIR}")
@@ -78,7 +82,7 @@ def main():
         pin_memory=True
     )
 
-    # 2. Teacher (frozen)
+    # 2. Teacher
     print(f"--- [train_student_kd_quick] Loading teacher from {TEACHER_WEIGHTS}...")
     teacher = FrequencyAwareTeacher(in_channels=4, out_channels=4).to(DEVICE)
     teacher.load_state_dict(torch.load(TEACHER_WEIGHTS, map_location=DEVICE))
@@ -100,11 +104,12 @@ def main():
     ).to(DEVICE)
     perceptual_loss_fn = lpips.LPIPS(net='vgg').to(DEVICE)
 
-    # 5. Optimizer
+    # 5. Optimizer + AMP
     optimizer = optim.Adam(student.parameters(), lr=LEARNING_RATE)
+    scaler    = GradScaler()
 
-    # 6. AMP scaler — FIXED: no 'cuda' argument
-    scaler = GradScaler()
+    train_loss_history = []
+    val_loss_history   = []
 
     print("--- [train_student_kd_quick] Starting quick KD training...")
 
@@ -118,7 +123,7 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Teacher forward (no grad)
+            # Teacher forward
             with torch.no_grad():
                 with autocast():
                     teacher_out_4ch, teacher_feat_spatial, _ = teacher(udc_batch)
@@ -139,7 +144,7 @@ def main():
                 )
                 loss_feature_spatial = feature_loss_fn(student_features, teacher_feat_spatial)
 
-                # LPIPS on pseudo-RGB
+                # LPIPS
                 pred_rgb_slice = student_out_4ch[:, :3, :, :]
                 gt_rgb_slice   = gt_batch[:, :3, :, :]
                 loss_lpips = perceptual_loss_fn(
@@ -147,7 +152,7 @@ def main():
                     gt_rgb_slice   * 2 - 1
                 ).mean()
 
-            # Frequency-based KD in float32
+            # Freq KD
             loss_freq_out = frequency_loss_fn(
                 student_out_4ch.float(),
                 teacher_out_4ch.float()
@@ -171,7 +176,8 @@ def main():
 
             train_loss += total_loss.item()
 
-        print(f"--- [train_student_kd_quick] Epoch {epoch+1} Train Loss: {train_loss / len(train_loader):.4f}")
+        avg_train_loss = train_loss / len(train_loader)
+        print(f"--- [train_student_kd_quick] Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
 
         # Quick val
         student.eval()
@@ -187,10 +193,35 @@ def main():
 
                 val_loss += loss_val.item()
 
-        print(f"--- [train_student_kd_quick] Epoch {epoch+1} Val Loss: {val_loss / len(val_loader):.4f}")
+        avg_val_loss = val_loss / len(val_loader)
+        print(f"--- [train_student_kd_quick] Epoch {epoch+1} Val Loss: {avg_val_loss:.4f}")
+
+        train_loss_history.append(avg_train_loss)
+        val_loss_history.append(avg_val_loss)
+
+        np.savez(
+            LOSS_HISTORY_FILE,
+            train_loss=np.array(train_loss_history, dtype=np.float32),
+            val_loss=np.array(val_loss_history, dtype=np.float32),
+        )
 
     torch.save(student.state_dict(), STUDENT_SAVE_PATH)
     print(f"--- [train_student_kd_quick] Saved quick student checkpoint: {STUDENT_SAVE_PATH}")
+
+    # Plot quick curves
+    epochs = np.arange(1, len(train_loss_history) + 1)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(epochs, train_loss_history, label="Train")
+    ax.plot(epochs, val_loss_history,   label="Val")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss (KD total)")
+    ax.set_title("Student QUICK KD Training & Validation Loss")
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(LOSS_PLOT_PNG, dpi=150)
+    plt.close(fig)
+    print(f"Saved quick loss plot to {LOSS_PLOT_PNG}")
 
 if __name__ == "__main__":
     main()

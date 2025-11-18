@@ -1,6 +1,7 @@
 # File: train_teacher_quick.py
 import sys
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,8 +9,8 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import lpips
+import matplotlib.pyplot as plt
 
-# Speed over reproducibility for quick testing
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
@@ -25,19 +26,20 @@ from models.mambair_teacher import FrequencyAwareTeacher
 from losses.frequency_loss import FFTAmplitudeLoss
 from losses.pixel_loss import CharbonnierLoss
 
-# ---------------- CONFIG (quick subset) ----------------
+# ---------------- CONFIG (subset) ----------------
 TRAIN_DIR = "data/UDC-SIT_subset/train"
 VAL_DIR   = "data/UDC-SIT_subset/val"
 
 PATCH_SIZE = 256
-BATCH_SIZE = 4       # small for quick test
-NUM_EPOCHS = 2       # just to see if everything runs
-
+BATCH_SIZE = 2
+NUM_EPOCHS = 10
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-CHECKPOINT_NAME = "teacher_quick_1epoch.pth"
-# ------------------------------------------------------
+CHECKPOINT_NAME   = "teacher_quick_1epoch.pth"
+LOSS_HISTORY_FILE = "teacher_quick_loss_history.npz"
+LOSS_PLOT_PNG     = "teacher_quick_loss_curves.png"
+# -------------------------------------------------
 
 print("\n--- [train_teacher_quick] Configuration ---")
 print(f"Train Dir: {TRAIN_DIR}")
@@ -49,7 +51,7 @@ print(f"Checkpoint: {CHECKPOINT_NAME}")
 print("-----------------------------------\n")
 
 def main():
-    # 1. Data
+    # Data
     print("--- [train_teacher_quick] Loading datasets...")
     train_dataset = UDCDataset(TRAIN_DIR, patch_size=PATCH_SIZE, is_train=True)
     val_dataset   = UDCDataset(VAL_DIR,   patch_size=PATCH_SIZE, is_train=False)
@@ -63,7 +65,7 @@ def main():
         num_workers=2, pin_memory=True
     )
 
-    # 2. Model
+    # Model
     print("--- [train_teacher_quick] Initializing model...")
     model = FrequencyAwareTeacher(
         in_channels=4,
@@ -71,20 +73,21 @@ def main():
         img_size=PATCH_SIZE
     ).to(DEVICE)
 
-    # 3. Losses
-    pixel_loss_fn = CharbonnierLoss().to(DEVICE)
+    # Losses
+    pixel_loss_fn      = CharbonnierLoss().to(DEVICE)
     perceptual_loss_fn = lpips.LPIPS(net='vgg').to(DEVICE)
-    fft_loss_fn = FFTAmplitudeLoss(
+    fft_loss_fn        = FFTAmplitudeLoss(
         loss_weight=1.0,
         focus_low_freq=True,
         cutoff=0.25
     ).to(DEVICE)
 
-    # 4. Optimizer (no scheduler needed for 1 epoch)
+    # Optimizer + AMP
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scaler    = GradScaler()
 
-    # 5. AMP scaler
-    scaler = GradScaler('cuda')
+    train_loss_history = []
+    val_loss_history   = []
 
     print("--- [train_teacher_quick] Starting quick training...")
 
@@ -120,9 +123,10 @@ def main():
 
             train_loss += total_loss.item()
 
-        print(f"--- [train_teacher_quick] Epoch {epoch+1} Train Loss: {train_loss / len(train_loader):.4f}")
+        avg_train_loss = train_loss / len(train_loader)
+        print(f"--- [train_teacher_quick] Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
 
-        # Quick val just to confirm no NaNs / runtime issues
+        # Quick val
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -136,10 +140,36 @@ def main():
 
                 val_loss += loss_val.item()
 
-        print(f"--- [train_teacher_quick] Epoch {epoch+1} Val Loss: {val_loss / len(val_loader):.4f}")
+        avg_val_loss = val_loss / len(val_loader)
+        print(f"--- [train_teacher_quick] Epoch {epoch+1} Val Loss: {avg_val_loss:.4f}")
+
+        train_loss_history.append(avg_train_loss)
+        val_loss_history.append(avg_val_loss)
+
+        # Save loss history
+        np.savez(
+            LOSS_HISTORY_FILE,
+            train_loss=np.array(train_loss_history, dtype=np.float32),
+            val_loss=np.array(val_loss_history, dtype=np.float32),
+        )
 
     torch.save(model.state_dict(), CHECKPOINT_NAME)
     print(f"--- [train_teacher_quick] Saved quick teacher checkpoint: {CHECKPOINT_NAME}")
+
+    # Plot quick curves
+    epochs = np.arange(1, len(train_loss_history) + 1)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(epochs, train_loss_history, label="Train")
+    ax.plot(epochs, val_loss_history,   label="Val")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Teacher QUICK Training & Validation Loss")
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(LOSS_PLOT_PNG, dpi=150)
+    plt.close(fig)
+    print(f"Saved quick loss plot to {LOSS_PLOT_PNG}")
 
 if __name__ == "__main__":
     main()

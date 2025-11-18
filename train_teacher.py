@@ -1,6 +1,7 @@
 # File: train_teacher.py
 import sys
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,6 +9,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import lpips
+import matplotlib.pyplot as plt
 
 # Speed vs reproducibility: favour speed on Colab
 torch.backends.cudnn.benchmark = True
@@ -26,17 +28,15 @@ from losses.frequency_loss import FFTAmplitudeLoss
 from losses.pixel_loss import CharbonnierLoss
 
 # ---------------- CONFIG ----------------
-# Full UDC-SIT dataset on Colab VM
 TRAIN_DIR = "/content/dataset/UDC-SIT/training"
 VAL_DIR   = "/content/dataset/UDC-SIT/validation"
 
 PATCH_SIZE = 256
 
-BATCH_SIZE = 8          # safe for A100
-NUM_EPOCHS = 22         # full run; can drop to ~16 if needed
-
+BATCH_SIZE   = 8          # safe for A100
+NUM_EPOCHS   = 22         # adjust if you need budget
 LEARNING_RATE = 1e-4
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Local + Drive checkpoints
 LOCAL_CHECKPOINT_NAME = "teacher_4ch_latest.pth"
@@ -47,10 +47,16 @@ os.makedirs(DRIVE_CHECKPOINT_DIR, exist_ok=True)
 DRIVE_LATEST_CKPT = os.path.join(DRIVE_CHECKPOINT_DIR, "teacher_latest.pth")
 DRIVE_BEST_CKPT   = os.path.join(DRIVE_CHECKPOINT_DIR, "teacher_best.pth")
 
+# Where to save loss histories
+LOCAL_LOSS_HISTORY = "teacher_loss_history_full.npz"
+DRIVE_LOSS_HISTORY = os.path.join(DRIVE_CHECKPOINT_DIR, "teacher_loss_history_full.npz")
+LOSS_PLOT_PNG      = "teacher_loss_curves_full.png"
+DRIVE_LOSS_PLOT    = os.path.join(DRIVE_CHECKPOINT_DIR, "teacher_loss_curves_full.png")
+
 # Loss weights
-W_PIXEL = 1.0
+W_PIXEL      = 1.0
 W_PERCEPTUAL = 0.1
-W_FFT = 0.05
+W_FFT        = 0.05
 # ----------------------------------------
 
 print("\n--- [train_teacher] Configuration ---")
@@ -91,9 +97,9 @@ def main():
 
     # 3. Losses
     print("--- [train_teacher] Initializing losses...")
-    pixel_loss_fn = CharbonnierLoss().to(DEVICE)
+    pixel_loss_fn      = CharbonnierLoss().to(DEVICE)
     perceptual_loss_fn = lpips.LPIPS(net='vgg').to(DEVICE)
-    fft_loss_fn = FFTAmplitudeLoss(
+    fft_loss_fn        = FFTAmplitudeLoss(
         loss_weight=1.0,
         focus_low_freq=True,
         cutoff=0.25
@@ -105,12 +111,15 @@ def main():
         optimizer, T_max=NUM_EPOCHS
     )
 
-    # 5. AMP scaler  ✅ FIXED: no 'cuda' argument
+    # 5. AMP scaler
     scaler = GradScaler()
 
-    print("--- [train_teacher] Starting training...")
+    # 6. Loss histories
+    train_loss_history = []
+    val_loss_history   = []
+    best_val_loss      = float("inf")
 
-    best_val_loss = float("inf")
+    print("--- [train_teacher] Starting training...")
 
     for epoch in range(NUM_EPOCHS):
         model.train()
@@ -171,7 +180,11 @@ def main():
 
         scheduler.step()
 
-        # --- Save checkpoints (local + Drive) ---
+        # Record loss histories
+        train_loss_history.append(avg_train_loss)
+        val_loss_history.append(avg_val_loss)
+
+        # Save checkpoints (local + Drive)
         torch.save(model.state_dict(), LOCAL_CHECKPOINT_NAME)
         torch.save(model.state_dict(), DRIVE_LATEST_CKPT)
         print(f"Saved latest teacher checkpoint to {LOCAL_CHECKPOINT_NAME} and {DRIVE_LATEST_CKPT}")
@@ -181,10 +194,44 @@ def main():
             torch.save(model.state_dict(), DRIVE_BEST_CKPT)
             print(f"New best val loss. Saved best teacher checkpoint to {DRIVE_BEST_CKPT}")
 
-    # Save final named checkpoint locally + to Drive
+        # Save loss curves each epoch (robust to crashes)
+        np.savez(
+            LOCAL_LOSS_HISTORY,
+            train_loss=np.array(train_loss_history, dtype=np.float32),
+            val_loss=np.array(val_loss_history, dtype=np.float32),
+        )
+        np.savez(
+            DRIVE_LOSS_HISTORY,
+            train_loss=np.array(train_loss_history, dtype=np.float32),
+            val_loss=np.array(val_loss_history, dtype=np.float32),
+        )
+
+    # Final named checkpoint
     torch.save(model.state_dict(), FINAL_CHECKPOINT_NAME)
     torch.save(model.state_dict(), os.path.join(DRIVE_CHECKPOINT_DIR, FINAL_CHECKPOINT_NAME))
     print(f"--- [train_teacher] Final model saved as {FINAL_CHECKPOINT_NAME} locally and on Drive")
+
+    # Final loss curves plot
+    epochs = np.arange(1, len(train_loss_history) + 1)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(epochs, train_loss_history, label="Train")
+    ax.plot(epochs, val_loss_history,   label="Val")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss (Charbonnier + FFT + LPIPS)")
+    ax.set_title("Teacher Training & Validation Loss")
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(LOSS_PLOT_PNG, dpi=150)
+    plt.close(fig)
+
+    # Save plot to Drive too
+    try:
+        import shutil
+        shutil.copy(LOSS_PLOT_PNG, DRIVE_LOSS_PLOT)
+        print(f"Saved loss curves plot to {LOSS_PLOT_PNG} and {DRIVE_LOSS_PLOT}")
+    except Exception as e:
+        print(f"Could not copy loss plot to Drive: {e}")
 
 if __name__ == "__main__":
     main()
