@@ -6,9 +6,8 @@ class FFTAmplitudeLoss(nn.Module):
     """
     Frequency-domain loss on amplitude of 2D FFT.
 
-    This version applies a smooth radial weighting that
-    emphasises low frequencies (where UDC flare lives),
-    while still using the full spectrum.
+    Applies a smooth radial weighting that emphasises low frequencies,
+    which correlate with UDC flares, while still using the full spectrum.
 
     pred, target: (B, C, H, W) in real space.
     """
