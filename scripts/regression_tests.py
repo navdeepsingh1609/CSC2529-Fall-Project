@@ -1,241 +1,113 @@
-# scripts/regression_tests.py
+#!/usr/bin/env python3
+"""
+Regression tests for UDC-SIT project.
+
+Runs:
+- Test A: Dataset sanity (lengths, shapes, basic stats)
+- Test B: Channel statistics (per-channel means for Input / GT / Teacher / Student)
+- Test C: FFTAmplitudeLoss behaviour (same vs low-freq vs high-freq noise)
+- Test D: Single KD training step sanity (loss components for student KD)
+
+Run from project root:
+
+    %cd /content/CSC2529-Fall-Project
+    !python scripts/regression_tests.py
+"""
 
 import os
 import sys
+import time
 
-# --- Add project root to sys.path ---
+# -----------------------------
+# 1. PATH FIXES
+# -----------------------------
+
+# Project root: one level up from scripts/
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-# ------------------------------------
+
+# MambaIR submodule root: contains `basicsr` etc.
+MAMBAIR_ROOT = os.path.join(PROJECT_ROOT, "models", "external", "MambaIR")
+if MAMBAIR_ROOT not in sys.path:
+    sys.path.insert(0, MAMBAIR_ROOT)
+    print(f"[regression_tests] Added MambaIR path: {MAMBAIR_ROOT}")
+
+# -----------------------------
+# 2. IMPORTS
+# -----------------------------
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import numpy as np
+import lpips
+import skimage.metrics
 
 from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
 from models.unet_student import UNetStudent
 from losses.frequency_loss import FFTAmplitudeLoss
 
-import torch
-import torch.nn.functional as F
-import numpy as np
-import lpips
-import skimage.metrics
+# -----------------------------
+# 3. CONFIG
+# -----------------------------
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRAIN_DIR = "/content/dataset/UDC-SIT/training"
-VAL_DIR   = "/content/dataset/UDC-SIT/validation"
+VAL_DIR = "/content/dataset/UDC-SIT/validation"
 PATCH_SIZE = 256
+
 TEACHER_WEIGHTS = "teacher_4ch_26_epochs_bs9.pth"
 STUDENT_WEIGHTS = "student_distilled_4ch_full_data.pth"
 
+# -----------------------------
+# 4. TEST A – DATASET SANITY
+# -----------------------------
 
-def test_dataset():
-    print("=== [Test A] Dataset ===")
+
+def test_a_dataset_sanity():
+    print("=== Test A: Dataset sanity check ===")
+
     train_ds = UDCDataset(TRAIN_DIR, patch_size=PATCH_SIZE, is_train=True)
-    val_ds   = UDCDataset(VAL_DIR,   patch_size=PATCH_SIZE, is_train=False)
+    val_ds = UDCDataset(VAL_DIR, patch_size=PATCH_SIZE, is_train=False)
+
     print(f"Train len: {len(train_ds)}, Val len: {len(val_ds)}")
 
-    x, y = train_ds[0]
-    print("Shape:", x.shape, y.shape)
-    print("UDC min/max/mean:", x.min().item(), x.max().item(), x.mean().item())
-    print("GT  min/max/mean:", y.min().item(), y.max().item(), y.mean().item())
+    # Grab one sample from train
+    udc, gt = train_ds[0]
+    print("Train sample shapes:", udc.shape, gt.shape)
 
-    x_hw4 = x.permute(1,2,0).numpy()
-    print("Round-trip shape (H,W,4):", x_hw4.shape)
-    print()
-
-
-def test_channel_means(teacher, student):
-    print("=== [Test B] Channel means ===")
-    # Use a fixed ID to keep this consistent
-    IMG_ID = "1004"
-    input_path = os.path.join(VAL_DIR, "input", f"{IMG_ID}.npy")
-    gt_path    = os.path.join(VAL_DIR, "GT",    f"{IMG_ID}.npy")
-
-    arr_in = np.load(input_path).astype(np.float32) / 1023.0
-    arr_gt = np.load(gt_path).astype(np.float32) / 1023.0
-
-    # Center crop
-    H, W, C = arr_in.shape
-    ps = PATCH_SIZE
-    r0 = (H - ps) // 2
-    c0 = (W - ps) // 2
-    inp = arr_in[r0:r0+ps, c0:c0+ps, :]
-    gt  = arr_gt[r0:r0+ps, c0:c0+ps, :]
-
-    inp_chw = torch.from_numpy(np.transpose(inp, (2,0,1))).unsqueeze(0).to(DEVICE)
-    gt_chw  = torch.from_numpy(np.transpose(gt,  (2,0,1))).unsqueeze(0).to(DEVICE)
-
-    with torch.no_grad():
-        t_out, _, _ = teacher(inp_chw)
-        s_out, _    = student(inp_chw)
-
-    t_out = torch.clamp(t_out, 0, 1)
-    s_out = torch.clamp(s_out, 0, 1)
-
-    def ch_means(name, bchw):
-        arr = bchw.squeeze(0).cpu().numpy()
-        m = arr.mean(axis=(1,2))
-        print(f"{name} (GR,R,B,GB): {m}")
-
-    ch_means("Input",   inp_chw)
-    ch_means("GT",      gt_chw)
-    ch_means("Teacher", t_out)
-    ch_means("Student", s_out)
-    print()
-
-
-def test_fft_loss():
-    print("=== [Test C] FFT loss ===")
-    fft_loss = FFTAmplitudeLoss().to(DEVICE)
-    x = torch.rand(1, 4, 64, 64, device=DEVICE)
-    y = x.clone()
-    y_low  = y + 0.1
-    noise  = (torch.rand_like(x) - 0.5) * 0.1
-    y_high = y + noise
-
-    print("same     :", fft_loss(x, y).item())
-    print("low freq :", fft_loss(x, y_low).item())
-    print("high freq:", fft_loss(x, y_high).item())
-    print()
-
-
-def test_kd_step(teacher, student):
-    print("=== [Test D] KD single step ===")
-    train_ds = UDCDataset(TRAIN_DIR, patch_size=PATCH_SIZE, is_train=True)
-    train_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=2)
-
-    pixel_loss_fn     = torch.nn.L1Loss().to(DEVICE)
-    feature_loss_fn   = torch.nn.L1Loss().to(DEVICE)
-    freq_loss_fn      = FFTAmplitudeLoss().to(DEVICE)
-    perceptual_loss_fn= lpips.LPIPS(net='vgg').to(DEVICE)
-
-    opt = torch.optim.Adam(student.parameters(), lr=2e-4)
-
-    udc, gt = next(iter(train_loader))
-    udc = udc.to(DEVICE)
-    gt  = gt.to(DEVICE)
-
-    teacher.eval()
-    student.train()
-    opt.zero_grad()
-
-    with torch.no_grad():
-        t_out, t_feat, _ = teacher(udc)
-
-    s_out, s_feat_raw = student(udc)
-
-    loss_pixel = pixel_loss_fn(s_out, gt)
-
-    s_feat = F.interpolate(
-        s_feat_raw,
-        size=t_feat.shape[2:],
-        mode="bilinear",
-        align_corners=False
+    print("Train sample stats (should be ~[0,1]):")
+    print(
+        f"  UDC min/max/mean: {udc.min().item()} "
+        f"{udc.max().item()} {udc.mean().item()}"
     )
-    loss_feat = feature_loss_fn(s_feat, t_feat)
+    print(
+        f"  GT  min/max/mean: {gt.min().item()} "
+        f"{gt.max().item()} {gt.mean().item()}"
+    )
 
-    loss_freq = freq_loss_fn(s_out, t_out)
-
-    pred_rgb = s_out[:, :3]
-    gt_rgb   = gt[:, :3]
-    loss_lpips = perceptual_loss_fn(pred_rgb*2-1, gt_rgb*2-1).mean()
-
-    total = 1.0*loss_pixel + 0.5*loss_feat + 0.2*loss_freq + 0.1*loss_lpips
-    total.backward()
-    opt.step()
-
-    print("pixel :", loss_pixel.item())
-    print("feat  :", loss_feat.item())
-    print("freq  :", loss_freq.item())
-    print("lpips :", loss_lpips.item())
-    print("total :", total.item())
+    # Round-trip to (H, W, 4) just to confirm ordering
+    udc_hw4 = udc.permute(1, 2, 0).cpu().numpy()
+    print("Round-trip shape (H,W,4):", udc_hw4.shape)
     print()
 
 
-def test_metrics_on_five(teacher, student):
-    print("=== [Test E] Metrics on 5 center patches ===")
-    input_files = sorted(os.listdir(os.path.join(VAL_DIR, "input")))
-    ids = [os.path.splitext(f)[0] for f in input_files][:5]
-    print("Using images:", ids)
-
-    loss_fn_lpips = lpips.LPIPS(net='vgg').to(DEVICE)
-
-    for img_id in ids:
-        inp_path = os.path.join(VAL_DIR, "input", f"{img_id}.npy")
-        gt_path  = os.path.join(VAL_DIR, "GT",    f"{img_id}.npy")
-
-        arr_in = np.load(inp_path).astype(np.float32) / 1023.0
-        arr_gt = np.load(gt_path).astype(np.float32) / 1023.0
-
-        H, W, C = arr_in.shape
-        ps = PATCH_SIZE
-        r0 = (H - ps) // 2
-        c0 = (W - ps) // 2
-        inp = arr_in[r0:r0+ps, c0:c0+ps, :]
-        gt  = arr_gt[r0:r0+ps, c0:c0+ps, :]
-
-        inp_chw = torch.from_numpy(np.transpose(inp, (2,0,1))).unsqueeze(0).to(DEVICE)
-        gt_chw  = torch.from_numpy(np.transpose(gt,  (2,0,1))).unsqueeze(0).to(DEVICE)
-
-        with torch.no_grad():
-            t_start = time.time()
-            t_out, _, _ = teacher(inp_chw)
-            t_time = (time.time() - t_start) * 1000.0
-
-            s_start = time.time()
-            s_out, _ = student(inp_chw)
-            s_time = (time.time() - s_start) * 1000.0
-
-        # 4-ch PSNR/SSIM
-        inp_np = inp_chw.squeeze(0).cpu().numpy()
-        gt_np  = gt_chw.squeeze(0).cpu().numpy()
-        t_np   = torch.clamp(t_out, 0, 1).squeeze(0).cpu().numpy()
-        s_np   = torch.clamp(s_out, 0, 1).squeeze(0).cpu().numpy()
-
-        def psnr_ssim_4ch(x, y):
-            # Average PSNR and SSIM across channels
-            psnrs = []
-            ssims = []
-            for c in range(4):
-                psnrs.append(skimage.metrics.peak_signal_noise_ratio(
-                    y[c], x[c], data_range=1.0
-                ))
-                ssims.append(skimage.metrics.structural_similarity(
-                    y[c], x[c], data_range=1.0
-                ))
-            return float(np.mean(psnrs)), float(np.mean(ssims))
-
-        psnr_in, ssim_in = psnr_ssim_4ch(inp_np, gt_np)
-        psnr_t,  ssim_t  = psnr_ssim_4ch(t_np,   gt_np)
-        psnr_s,  ssim_s  = psnr_ssim_4ch(s_np,   gt_np)
-
-        # Simple LPIPS on “fake RGB”: take channels 0,1,2 as RGB
-        def lpips_rgb(x3, y3):
-            x_t = torch.from_numpy(x3).permute(2,0,1).unsqueeze(0).to(DEVICE)
-            y_t = torch.from_numpy(y3).permute(2,0,1).unsqueeze(0).to(DEVICE)
-            with torch.no_grad():
-                return float(loss_fn_lpips(x_t*2-1, y_t*2-1).item())
-
-        inp_rgb = np.stack([inp_np[0], inp_np[1], inp_np[2]], axis=-1)
-        gt_rgb  = np.stack([gt_np[0],  gt_np[1],  gt_np[2]],  axis=-1)
-        t_rgb   = np.stack([t_np[0],   t_np[1],   t_np[2]],   axis=-1)
-        s_rgb   = np.stack([s_np[0],   s_np[1],   s_np[2]],   axis=-1)
-
-        lpips_in = lpips_rgb(inp_rgb, gt_rgb)
-        lpips_t  = lpips_rgb(t_rgb,   gt_rgb)
-        lpips_s  = lpips_rgb(s_rgb,   gt_rgb)
-
-        print(f"Image {img_id}:")
-        print(f"  Input   -> PSNR: {psnr_in:.2f}, SSIM: {ssim_in:.4f}, LPIPS: {lpips_in:.4f}")
-        print(f"  Teacher -> PSNR: {psnr_t:.2f}, SSIM: {ssim_t:.4f}, LPIPS: {lpips_t:.4f}, Time: {t_time:.2f} ms")
-        print(f"  Student -> PSNR: {psnr_s:.2f}, SSIM: {ssim_s:.4f}, LPIPS: {lpips_s:.4f}, Time: {s_time:.2f} ms")
-        print()
+# -----------------------------
+# 5. TEST B – CHANNEL STATS
+# -----------------------------
 
 
-if __name__ == "__main__":
-    print("Device:", DEVICE)
-    print("Loading models...")
+def test_b_channel_means():
+    print("=== Test B: Channel means (GR, R, B, GB) ===")
+
+    # One validation sample
+    val_ds = UDCDataset(VAL_DIR, patch_size=PATCH_SIZE, is_train=False)
+    udc, gt = val_ds[0]  # (4,H,W) in [0,1]
+
+    # Load models + weights
     teacher = FrequencyAwareTeacher(in_channels=4, out_channels=4).to(DEVICE)
     teacher.load_state_dict(torch.load(TEACHER_WEIGHTS, map_location=DEVICE))
     teacher.eval()
@@ -244,8 +116,170 @@ if __name__ == "__main__":
     student.load_state_dict(torch.load(STUDENT_WEIGHTS, map_location=DEVICE))
     student.eval()
 
-    test_dataset()
-    test_fft_loss()
-    test_channel_means(teacher, student)
-    test_kd_step(teacher, student)
-    test_metrics_on_five(teacher, student)
+    with torch.no_grad():
+        udc_batch = udc.unsqueeze(0).to(DEVICE)  # (1,4,H,W)
+        teacher_out, _, _ = teacher(udc_batch)   # (1,4,H,W)
+        student_out, _ = student(udc_batch)      # (1,4,H,W)
+
+    # Compute per-channel means
+    def channel_means(x4chw: torch.Tensor):
+        # x4chw: (1,4,H,W)
+        arr = x4chw.squeeze(0).cpu().numpy()  # (4,H,W)
+        means = arr.reshape(4, -1).mean(axis=1)
+        return means
+
+    input_means = channel_means(udc_batch)
+    gt_means = channel_means(gt.unsqueeze(0).to(DEVICE))
+    teacher_means = channel_means(teacher_out)
+    student_means = channel_means(student_out)
+
+    print("=== Channel means (normalized [0,1]) ===")
+    print(f"Input channel means (GR,R,B,GB): {input_means}")
+    print(f"GT channel means    (GR,R,B,GB): {gt_means}")
+    print(f"Teacher channel means (GR,R,B,GB): {teacher_means}")
+    print(f"Student channel means (GR,R,B,GB): {student_means}")
+    print()
+
+
+# -----------------------------
+# 6. TEST C – FFT LOSS BEHAVIOUR
+# -----------------------------
+
+
+def test_c_fft_loss():
+    print("=== Test C: FFTAmplitudeLoss behaviour ===")
+    loss_fn = FFTAmplitudeLoss().to(DEVICE)
+
+    # Synthetic "image"
+    torch.manual_seed(0)
+    x = torch.rand(1, 4, 64, 64, device=DEVICE)
+
+    # Case 1: identical
+    y_same = x.clone()
+    loss_same = loss_fn(x, y_same).item()
+
+    # Case 2: low-frequency bias – add smooth offset
+    y_lowfreq = x + 0.05
+    loss_low = loss_fn(x, y_lowfreq).item()
+
+    # Case 3: high-frequency noise – add random noise
+    noise = 0.05 * torch.randn_like(x)
+    y_highfreq = x + noise
+    loss_high = loss_fn(x, y_highfreq).item()
+
+    print(f"FFT loss (same):        {loss_same}")
+    print(f"FFT loss (low-freq bias): {loss_low}")
+    print(f"FFT loss (high-freq noise): {loss_high}")
+    print()
+
+
+# -----------------------------
+# 7. TEST D – KD STEP SANITY
+# -----------------------------
+
+
+def test_d_kd_step():
+    print("=== Test D: Single KD training step sanity ===")
+
+    # 1. Dataset / DataLoader (one small batch)
+    train_ds = UDCDataset(TRAIN_DIR, patch_size=PATCH_SIZE, is_train=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=2, shuffle=True, num_workers=2, pin_memory=True
+    )
+
+    # 2. Models
+    teacher = FrequencyAwareTeacher(in_channels=4, out_channels=4).to(DEVICE)
+    teacher.load_state_dict(torch.load(TEACHER_WEIGHTS, map_location=DEVICE))
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    student = UNetStudent(in_channels=4, out_channels=4).to(DEVICE)
+    student.load_state_dict(torch.load(STUDENT_WEIGHTS, map_location=DEVICE))
+    student.train()
+
+    # 3. Losses
+    pixel_loss_fn = torch.nn.L1Loss().to(DEVICE)
+    feature_loss_fn = torch.nn.L1Loss().to(DEVICE)
+    freq_loss_fn = FFTAmplitudeLoss().to(DEVICE)
+    lpips_loss_fn = lpips.LPIPS(net="vgg").to(DEVICE)
+
+    # 4. Optimizer
+    optimizer = torch.optim.Adam(student.parameters(), lr=2e-4)
+
+    # 5. Loss weights (same as train_student_kd.py)
+    W_PIXEL = 1.0
+    W_FEATURE = 0.5
+    W_FREQ = 0.2
+    W_LPIPS = 0.1
+
+    # 6. One batch
+    udc_batch, gt_batch = next(iter(train_loader))
+    udc_batch = udc_batch.to(DEVICE, non_blocking=True)  # (B,4,H,W)
+    gt_batch = gt_batch.to(DEVICE, non_blocking=True)    # (B,4,H,W)
+
+    with torch.no_grad():
+        teacher_out, teacher_feat_spatial, _ = teacher(udc_batch)
+
+    student_out, student_features_raw = student(udc_batch)
+
+    # Pixel loss
+    loss_pixel = pixel_loss_fn(student_out, gt_batch)
+
+    # Feature KD loss
+    student_features_resized = F.interpolate(
+        student_features_raw,
+        size=teacher_feat_spatial.shape[2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    loss_feature = feature_loss_fn(student_features_resized, teacher_feat_spatial)
+
+    # Frequency KD loss
+    loss_freq = freq_loss_fn(student_out.float(), teacher_out.float())
+
+    # LPIPS on RGB slices
+    pred_rgb = student_out[:, :3, :, :]
+    gt_rgb = gt_batch[:, :3, :, :]
+    lpips_val = lpips_loss_fn(
+        (pred_rgb * 2 - 1), (gt_rgb * 2 - 1)
+    ).mean()
+    loss_lpips = lpips_val
+
+    total_loss = (
+        W_PIXEL * loss_pixel
+        + W_FEATURE * loss_feature
+        + W_FREQ * loss_freq
+        + W_LPIPS * loss_lpips
+    )
+
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    print("KD step losses:")
+    print(f"  pixel   : {loss_pixel.item()}")
+    print(f"  feature : {loss_feature.item()}")
+    print(f"  freq    : {loss_freq.item()}")
+    print(f"  lpips   : {loss_lpips.item()}")
+    print(f"  total   : {total_loss.item()}")
+    print()
+
+
+# -----------------------------
+# 8. MAIN
+# -----------------------------
+
+if __name__ == "__main__":
+    print(f"PROJECT_ROOT = {PROJECT_ROOT}")
+    print(f"MAMBAIR_ROOT = {MAMBAIR_ROOT}")
+    print(f"Device: {DEVICE}")
+    print()
+
+    # Run tests in order
+    test_a_dataset_sanity()
+    test_b_channel_means()
+    test_c_fft_loss()
+    test_d_kd_step()
+
+    print("All regression tests finished.")
