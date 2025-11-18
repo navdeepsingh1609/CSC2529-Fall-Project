@@ -10,8 +10,8 @@ SOURCE_DIR = "/content/dataset/UDC-SIT"
 # Target paths (where the small subset will be)
 TARGET_DIR = "data/UDC-SIT_subset"
 
-NUM_TRAIN_FILES = 100  # Number of training files to copy
-NUM_VAL_FILES = 20     # Number of validation files to copy
+NUM_TRAIN_FILES = 10  # Number of training files to copy
+NUM_VAL_FILES = 10     # Number of validation files to copy
 # --------------
 
 def copy_subset(source_input_dir, source_gt_dir, target_input_dir, target_gt_dir, num_files):
