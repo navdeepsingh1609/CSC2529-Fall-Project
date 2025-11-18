@@ -1,3 +1,4 @@
+# File: testing.py
 import os, sys, glob, time, zipfile
 import numpy as np
 import torch
@@ -8,15 +9,17 @@ import pandas as pd
 from google.colab import files
 
 # ===================== CONFIG =====================
-DATA_ROOT = "/content/dataset/UDC-SIT"
-SPLIT = "testing"   # <-- change to "validation" or "training" as needed
+VAL_DIR = "/content/dataset/UDC-SIT/validation"
 TEACHER_WEIGHTS_PATH = "teacher_4ch_26_epochs_bs9.pth"
 STUDENT_WEIGHTS_PATH = "student_distilled_4ch_full_data.pth"
-NUM_EXAMPLES = None    # None = use ALL images in this split, or set e.g. 5
+
+# Set NUM_EXAMPLES = None to use the full validation split
+NUM_EXAMPLES = None   # e.g., 5 for quick debug, None for full eval
+
 PATCH_SIZE = 256
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-PATCH_SAVE_DIR = f"patch_outputs_{SPLIT}"  # 4-ch .npy patches will be saved here
+PATCH_SAVE_DIR = "patch_outputs"  # 4-ch .npy patches will be saved here
 os.makedirs(PATCH_SAVE_DIR, exist_ok=True)
 # ===================================================
 
@@ -30,14 +33,9 @@ print(f"Added {mambair_path} to sys.path")
 from models.mambair_teacher import FrequencyAwareTeacher
 from models.unet_student import UNetStudent
 
-# ============ Helper functions ============
 
 def load_center_patch_4ch(npy_path, patch_size=256):
-    """
-    Load a full UDC-SIT .npy file (H,W,4 in [0,1023]) and
-    return a center patch of size (patch_size, patch_size, 4) in [0,1023].
-    """
-    arr = np.load(npy_path).astype(np.float32)   # (H,W,4)
+    arr = np.load(npy_path).astype(np.float32)   # (H,W,4) in [0,1023]
     H, W, C = arr.shape
     ps = patch_size
     r0 = (H - ps) // 2
@@ -47,28 +45,23 @@ def load_center_patch_4ch(npy_path, patch_size=256):
     return patch
 
 
-def bayer4_to_rgb_balanced(bayer_4ch, r_gain=1.9, b_gain=1.9):
+def bayer4_to_rgb_naive(bayer_4ch):
     """
-    Simple demosaic-ish viewer:
-      - Treat channels as (GR, R, B, GB)
-      - G = average of GR and GB
-      - Apply a fixed gain to R and B to reduce green cast.
-
-    Input:  (H,W,4) or (4,H,W) in [0,1023] or [0,1]
-    Output: (H,W,3) in [0,1] for visualization / LPIPS.
+    Simple demosaic for visualization and LPIPS.
+    bayer_4ch: (H,W,4) or (4,H,W), values in [0,1] or [0,1023].
     """
     arr = np.asarray(bayer_4ch, dtype=np.float32)
 
     if arr.ndim != 3:
         raise ValueError(f"Expected 3D array, got {arr.shape}")
 
-    # Ensure we have (H,W,4)
-    if arr.shape[-1] == 4:        # (H,W,4)
+    # Ensure (H,W,4)
+    if arr.shape[-1] == 4:
         GR = arr[..., 0]
         R  = arr[..., 1]
         B  = arr[..., 2]
         GB = arr[..., 3]
-    elif arr.shape[0] == 4:       # (4,H,W)
+    elif arr.shape[0] == 4:
         GR = arr[0]
         R  = arr[1]
         B  = arr[2]
@@ -76,32 +69,30 @@ def bayer4_to_rgb_balanced(bayer_4ch, r_gain=1.9, b_gain=1.9):
     else:
         raise ValueError(f"Expected shape (...,4), got {arr.shape}")
 
-    # Scale to [0,1] if we're in [0,1023]
-    max_val = arr.max()
-    if max_val > 2.0:
+    # Scale to [0,1]
+    if arr.max() > 2.0:
         scale = 1023.0
     else:
         scale = 1.0
 
-    G = (GR + GB) / (2.0 * scale)
-    Rn = (R / scale) * r_gain
-    Bn = (B / scale) * b_gain
+    Rn = R / scale
+    Bn = B / scale
+    Gn = (GR + GB) / (2.0 * scale)
 
-    rgb = np.stack([Rn, G, Bn], axis=-1)
+    rgb = np.stack([Rn, Gn, Bn], axis=-1)
     rgb = np.clip(rgb, 0.0, 1.0)
     return rgb
 
 
 def numpy_to_lpips_tensor(img_np, device):
     """
-    Convert an RGB image in [0,1] (H,W,3) to LPIPS tensor in [-1,1], shape (1,3,H,W).
+    Convert RGB (H,W,3) in [0,1] to LPIPS tensor in [-1,1], shape (1,3,H,W).
     """
     t = torch.from_numpy(img_np).float().to(device)
     t = t.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
-    t = t * 2.0 - 1.0                    # [0,1] -> [-1,1]
+    t = t * 2.0 - 1.0
     return t
 
-# ============ Load models ============
 
 print(f"Device: {DEVICE}")
 print("Loading models...")
@@ -118,197 +109,196 @@ print(f"Loaded Student: {STUDENT_WEIGHTS_PATH}")
 
 lpips_model = lpips.LPIPS(net='vgg').to(DEVICE)
 
-# ============ Collect file list ============
+# ------------ Pick images ------------
 
-input_dir = os.path.join(DATA_ROOT, SPLIT, "input")
-gt_dir    = os.path.join(DATA_ROOT, SPLIT, "GT")
-
-input_paths = sorted(glob.glob(os.path.join(input_dir, "*.npy")))
+input_paths = sorted(glob.glob(os.path.join(VAL_DIR, "input", "*.npy")))
 if not input_paths:
-    raise RuntimeError(f"No .npy files found in {input_dir}")
+    raise RuntimeError(f"No .npy files found in {os.path.join(VAL_DIR, 'input')}")
 
 if NUM_EXAMPLES is not None:
-    input_paths = input_paths[:NUM_EXAMPLES]
+    input_paths = input_paths[:min(NUM_EXAMPLES, len(input_paths))]
 
-have_gt = os.path.isdir(gt_dir) and len(glob.glob(os.path.join(gt_dir, "*.npy"))) > 0
+print("\nUsing validation images:")
+for p in input_paths:
+    print("  ", os.path.basename(p))
 
-print(f"\nEvaluating split: {SPLIT}")
-print(f"Found {len(input_paths)} input files.")
-print(f"Ground-truth available: {have_gt}")
+# ------------ Metrics containers ------------
 
-# ============ Metrics containers ============
+results_per_image = []  # list of dicts
 
-results_per_image = []  # each element is a dict with metrics
-
-# For plotting: store RGB views (optional)
 plot_inputs   = []
 plot_teachers = []
 plot_students = []
 plot_gts      = []
 
-# ============ Main loop ============
+# ------------ Main loop ------------
 
 for idx, input_path in enumerate(input_paths):
     img_id = os.path.splitext(os.path.basename(input_path))[0]
-    gt_path = os.path.join(gt_dir, os.path.basename(input_path)) if have_gt else None
+    gt_path = input_path.replace("/input/", "/GT/")
 
     print(f"\n[{idx+1}/{len(input_paths)}] Image ID: {img_id}")
 
+    # 1) Load center patches in [0,1023]
     inp_patch_4ch = load_center_patch_4ch(input_path, PATCH_SIZE)
+    gt_patch_4ch  = load_center_patch_4ch(gt_path,    PATCH_SIZE)
 
-    if have_gt:
-        gt_patch_4ch  = load_center_patch_4ch(gt_path, PATCH_SIZE)
+    # 2) Normalize to [0,1], (1,4,H,W)
+    inp_norm = (inp_patch_4ch / 1023.0).astype(np.float32)
+    gt_norm  = (gt_patch_4ch  / 1023.0).astype(np.float32)
 
-    # Normalize to [0,1] and convert to (1,4,H,W)
-    inp_norm = (inp_patch_4ch / 1023.0).astype(np.float32)  # (H,W,4)
-    inp_chw  = np.transpose(inp_norm, (2, 0, 1))            # (4,H,W)
+    inp_chw = np.transpose(inp_norm, (2, 0, 1))  # (4,H,W)
+    gt_chw  = np.transpose(gt_norm,  (2, 0, 1))  # (4,H,W)
+
     inp_bchw = torch.from_numpy(inp_chw).unsqueeze(0).to(DEVICE)
+    gt_bchw  = torch.from_numpy(gt_chw).unsqueeze(0).to(DEVICE)
 
-    if have_gt:
-        gt_norm = (gt_patch_4ch / 1023.0).astype(np.float32)
-        gt_chw  = np.transpose(gt_norm, (2, 0, 1))
-        gt_bchw = torch.from_numpy(gt_chw).unsqueeze(0).to(DEVICE)
-
-    # 1) Forward through models
+    # 3) Forward through models with CUDA sync for fair timing
     with torch.no_grad():
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
         t_start = time.time()
         teacher_out_bchw, _, _ = teacher(inp_bchw)
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
         t_time = time.time() - t_start
 
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
         t_start = time.time()
         student_out_bchw, _ = student(inp_bchw)
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
         s_time = time.time() - t_start
 
-    # 2) Clamp outputs to [0,1] for metrics
+    # 4) Clamp outputs to [0,1]
     teacher_out_bchw = torch.clamp(teacher_out_bchw, 0.0, 1.0)
     student_out_bchw = torch.clamp(student_out_bchw, 0.0, 1.0)
 
-    # 3) Back to numpy (H,W,4) in [0,1]
+    # 5) Back to numpy (H,W,4)
+    inp_4n     = inp_norm
+    gt_4n      = gt_norm
     teacher_4n = teacher_out_bchw.squeeze(0).permute(1, 2, 0).cpu().numpy()
     student_4n = student_out_bchw.squeeze(0).permute(1, 2, 0).cpu().numpy()
 
-    # Initialize metric dict for this image
-    m = {
+    # 6) 4-channel PSNR/SSIM
+    psnr_input   = skimage.metrics.peak_signal_noise_ratio(gt_4n, inp_4n, data_range=1.0)
+    ssim_input   = skimage.metrics.structural_similarity(gt_4n, inp_4n, data_range=1.0, channel_axis=-1)
+
+    psnr_teacher = skimage.metrics.peak_signal_noise_ratio(gt_4n, teacher_4n, data_range=1.0)
+    ssim_teacher = skimage.metrics.structural_similarity(gt_4n, teacher_4n, data_range=1.0, channel_axis=-1)
+
+    psnr_student = skimage.metrics.peak_signal_noise_ratio(gt_4n, student_4n, data_range=1.0)
+    ssim_student = skimage.metrics.structural_similarity(gt_4n, student_4n, data_range=1.0, channel_axis=-1)
+
+    # 7) LPIPS on simple RGB projection
+    inp_rgb     = bayer4_to_rgb_naive(inp_patch_4ch)
+    gt_rgb      = bayer4_to_rgb_naive(gt_patch_4ch)
+    teacher_rgb = bayer4_to_rgb_naive(teacher_4n * 1023.0)
+    student_rgb = bayer4_to_rgb_naive(student_4n * 1023.0)
+
+    gt_lp      = numpy_to_lpips_tensor(gt_rgb,      DEVICE)
+    inp_lp     = numpy_to_lpips_tensor(inp_rgb,     DEVICE)
+    teacher_lp = numpy_to_lpips_tensor(teacher_rgb, DEVICE)
+    student_lp = numpy_to_lpips_tensor(student_rgb, DEVICE)
+
+    with torch.no_grad():
+        lpips_input   = lpips_model(gt_lp, inp_lp).item()
+        lpips_teacher = lpips_model(gt_lp, teacher_lp).item()
+        lpips_student = lpips_model(gt_lp, student_lp).item()
+
+    # 8) Save metrics for this image
+    results_per_image.append({
         "id": img_id,
-        "psnr_input":   None,
-        "ssim_input":   None,
-        "lpips_input":  None,
-        "psnr_teacher": None,
-        "ssim_teacher": None,
-        "lpips_teacher": None,
+        "psnr_input": psnr_input,
+        "ssim_input": ssim_input,
+        "lpips_input": lpips_input,
+
+        "psnr_teacher": psnr_teacher,
+        "ssim_teacher": ssim_teacher,
+        "lpips_teacher": lpips_teacher,
         "time_teacher_ms": t_time * 1000.0,
-        "psnr_student": None,
-        "ssim_student": None,
-        "lpips_student": None,
+
+        "psnr_student": psnr_student,
+        "ssim_student": ssim_student,
+        "lpips_student": lpips_student,
         "time_student_ms": s_time * 1000.0,
-    }
+    })
 
-    if have_gt:
-        # 4) 4-channel PSNR/SSIM (Bayer space)
-        inp_4n = inp_norm
-        gt_4n  = gt_norm
+    print(f"  Input   -> PSNR: {psnr_input:.2f}, SSIM: {ssim_input:.4f}, LPIPS: {lpips_input:.4f}")
+    print(f"  Teacher -> PSNR: {psnr_teacher:.2f}, SSIM: {ssim_teacher:.4f}, LPIPS: {lpips_teacher:.4f}, Time: {t_time*1000:.2f} ms")
+    print(f"  Student -> PSNR: {psnr_student:.2f}, SSIM: {ssim_student:.4f}, LPIPS: {lpips_student:.4f}, Time: {s_time*1000:.2f} ms")
 
-        m["psnr_input"]   = skimage.metrics.peak_signal_noise_ratio(gt_4n, inp_4n, data_range=1.0)
-        m["ssim_input"]   = skimage.metrics.structural_similarity(gt_4n, inp_4n, data_range=1.0, channel_axis=-1)
-
-        m["psnr_teacher"] = skimage.metrics.peak_signal_noise_ratio(gt_4n, teacher_4n, data_range=1.0)
-        m["ssim_teacher"] = skimage.metrics.structural_similarity(gt_4n, teacher_4n, data_range=1.0, channel_axis=-1)
-
-        m["psnr_student"] = skimage.metrics.peak_signal_noise_ratio(gt_4n, student_4n, data_range=1.0)
-        m["ssim_student"] = skimage.metrics.structural_similarity(gt_4n, student_4n, data_range=1.0, channel_axis=-1)
-
-        # 5) LPIPS on balanced RGB
-        inp_rgb     = bayer4_to_rgb_balanced(inp_patch_4ch)
-        gt_rgb      = bayer4_to_rgb_balanced(gt_patch_4ch)
-        teacher_rgb = bayer4_to_rgb_balanced(teacher_4n * 1023.0)
-        student_rgb = bayer4_to_rgb_balanced(student_4n * 1023.0)
-
-        gt_lp      = numpy_to_lpips_tensor(gt_rgb,      DEVICE)
-        inp_lp     = numpy_to_lpips_tensor(inp_rgb,     DEVICE)
-        teacher_lp = numpy_to_lpips_tensor(teacher_rgb, DEVICE)
-        student_lp = numpy_to_lpips_tensor(student_rgb, DEVICE)
-
-        with torch.no_grad():
-            m["lpips_input"]   = lpips_model(gt_lp, inp_lp).item()
-            m["lpips_teacher"] = lpips_model(gt_lp, teacher_lp).item()
-            m["lpips_student"] = lpips_model(gt_lp, student_lp).item()
-
-        # Store images for plotting
-        plot_inputs.append(inp_rgb)
-        plot_teachers.append(teacher_rgb)
-        plot_students.append(student_rgb)
-        plot_gts.append(gt_rgb)
-
-        # Print a compact summary for this image
-        print(f"  Input   -> PSNR: {m['psnr_input']:.2f}, SSIM: {m['ssim_input']:.4f}, LPIPS: {m['lpips_input']:.4f}")
-        print(f"  Teacher -> PSNR: {m['psnr_teacher']:.2f}, SSIM: {m['ssim_teacher']:.4f}, LPIPS: {m['lpips_teacher']:.4f}, Time: {m['time_teacher_ms']:.2f} ms")
-        print(f"  Student -> PSNR: {m['psnr_student']:.2f}, SSIM: {m['ssim_student']:.4f}, LPIPS: {m['lpips_student']:.4f}, Time: {m['time_student_ms']:.2f} ms")
-    else:
-        print("  No GT available for this split - metrics skipped, only timings logged.")
-
-    # 6) Save 4-ch patches as .npy (in original [0,1023] scale)
+    # 9) Save 4-ch patches as .npy in [0,1023]
     np.save(os.path.join(PATCH_SAVE_DIR, f"{img_id}_input_patch.npy"),   inp_patch_4ch)
-    if have_gt:
-        np.save(os.path.join(PATCH_SAVE_DIR, f"{img_id}_gt_patch.npy"),      gt_patch_4ch)
+    np.save(os.path.join(PATCH_SAVE_DIR, f"{img_id}_gt_patch.npy"),      gt_patch_4ch)
     np.save(os.path.join(PATCH_SAVE_DIR, f"{img_id}_teacher_patch.npy"), teacher_4n * 1023.0)
     np.save(os.path.join(PATCH_SAVE_DIR, f"{img_id}_student_patch.npy"), student_4n * 1023.0)
 
-    # 7) Save this record
-    results_per_image.append(m)
+    # 10) Store images for plotting
+    plot_inputs.append(inp_rgb)
+    plot_teachers.append(teacher_rgb)
+    plot_students.append(student_rgb)
+    plot_gts.append(gt_rgb)
 
-# ============ Convert to DataFrame and print summary ============
+# ------------ Plot grid (only if small) ------------
+rows = len(results_per_image)
+cols = 4
 
-df = pd.DataFrame(results_per_image)
-csv_name = f"metrics_{SPLIT}.csv"
-df.to_csv(csv_name, index=False)
-print(f"\nSaved per-image metrics to {csv_name}")
+if rows <= 10:  # avoid gigantic figures for full val
+    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
 
-if have_gt:
-    # Only average over non-NaN entries
-    cols_to_avg = [
-        "psnr_input", "ssim_input", "lpips_input",
-        "psnr_teacher", "ssim_teacher", "lpips_teacher",
-        "psnr_student", "ssim_student", "lpips_student",
-        "time_teacher_ms", "time_student_ms",
-    ]
-    print(f"\n=== Averages for split: {SPLIT} ===")
-    print(df[cols_to_avg].mean(numeric_only=True))
+    if rows == 1:
+        axes = np.expand_dims(axes, axis=0)
 
-    # Optional: quick 5×4 grid of first few images
-    num_show = min(5, len(plot_inputs))
-    if num_show > 0:
-        fig, axes = plt.subplots(num_show, 4, figsize=(20, 4 * num_show))
-        if num_show == 1:
-            axes = np.expand_dims(axes, axis=0)
+    for i, res in enumerate(results_per_image):
+        img_id = res["id"]
 
-        for i in range(num_show):
-            axes[i, 0].imshow(plot_inputs[i])
-            axes[i, 0].set_title(f"{df['id'][i]} - Input")
-            axes[i, 0].axis("off")
+        axes[i, 0].imshow(plot_inputs[i])
+        axes[i, 0].set_title(f"{img_id} - Input")
+        axes[i, 0].axis("off")
 
-            axes[i, 1].imshow(plot_teachers[i])
-            axes[i, 1].set_title("Teacher")
-            axes[i, 1].axis("off")
+        axes[i, 1].imshow(plot_teachers[i])
+        axes[i, 1].set_title("Teacher")
+        axes[i, 1].axis("off")
 
-            axes[i, 2].imshow(plot_students[i])
-            axes[i, 2].set_title("Student")
-            axes[i, 2].axis("off")
+        axes[i, 2].imshow(plot_students[i])
+        axes[i, 2].set_title("Student")
+        axes[i, 2].axis("off")
 
-            axes[i, 3].imshow(plot_gts[i])
-            axes[i, 3].set_title("GT")
-            axes[i, 3].axis("off")
+        axes[i, 3].imshow(plot_gts[i])
+        axes[i, 3].set_title("GT")
+        axes[i, 3].axis("off")
 
-        plt.tight_layout()
-        plt.show()
+    plt.tight_layout()
+    plt.show()
+else:
+    print(f"\n[Info] Skipping qualitative grid (rows={rows} too large).")
 
-# ============ Zip and download patches + CSV ============
+# ------------ Print per-image metrics ------------
+print("\n\n=== Per-image metrics (4-ch PSNR/SSIM + RGB LPIPS) ===")
+for res in results_per_image:
+    print(f"\nImage: {res['id']}")
+    print(f"  Input   -> PSNR: {res['psnr_input']:.2f}, SSIM: {res['ssim_input']:.4f}, LPIPS: {res['lpips_input']:.4f}")
+    print(f"  Teacher -> PSNR: {res['psnr_teacher']:.2f}, SSIM: {res['ssim_teacher']:.4f}, LPIPS: {res['lpips_teacher']:.4f}, Time: {res['time_teacher_ms']:.2f} ms")
+    print(f"  Student -> PSNR: {res['psnr_student']:.2f}, SSIM: {res['ssim_student']:.4f}, LPIPS: {res['lpips_student']:.4f}, Time: {res['time_student_ms']:.2f} ms")
 
-zip_path = f"patch_outputs_{SPLIT}.zip"
+# ------------ Summary table (averages) ------------
+df = pd.DataFrame(results_per_image).set_index("id")
+print("\n\n=== Averages for split: testing ===")
+print(df.mean())
+
+# Optionally save to CSV
+df.to_csv("testing_metrics.csv")
+print("\nSaved metrics to testing_metrics.csv")
+
+# ------------ Zip and download patches ------------
+zip_path = "patch_outputs.zip"
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
     for fname in os.listdir(PATCH_SAVE_DIR):
         full_path = os.path.join(PATCH_SAVE_DIR, fname)
         zf.write(full_path, arcname=fname)
-    zf.write(csv_name, arcname=csv_name)
 
-print(f"\nZipped patches + metrics CSV to: {zip_path}")
+print(f"\nZipped 4-channel patches to: {zip_path}")
 files.download(zip_path)
+print("You can also download testing_metrics.csv from the Colab file browser.")
