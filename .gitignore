@@ -15,3 +15,4 @@ data/UDC-SIT_subset/
 # IDE / OS specific
 .DS_Store
 .vscode/
+.temp/*
