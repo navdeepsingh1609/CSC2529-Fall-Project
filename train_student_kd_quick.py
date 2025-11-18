@@ -35,7 +35,7 @@ VAL_DIR   = "data/UDC-SIT_subset/val"
 PATCH_SIZE = 256
 BATCH_SIZE = 16
 LEARNING_RATE = 2e-4
-NUM_EPOCHS = 1
+NUM_EPOCHS = 12
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TEACHER_WEIGHTS   = "teacher_quick_1epoch.pth"
