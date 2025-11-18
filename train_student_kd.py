@@ -33,14 +33,14 @@ VAL_DIR   = "/content/dataset/UDC-SIT/validation"
 
 PATCH_SIZE = 256
 
-BATCH_SIZE = 64          # adjust down to 24 if you hit OOM
+BATCH_SIZE = 64          # you confirmed 64 fits for student on A100
 LEARNING_RATE = 2e-4
-NUM_EPOCHS = 20          # full setting; if needed, drop to 14
+NUM_EPOCHS = 20          # good full run; can drop to ~14 for budget
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Teacher checkpoint (already trained)
-TEACHER_WEIGHTS = "teacher_4ch_22epochs_bs8.pth"  # or your previous teacher file
+# Teacher checkpoint (trained by train_teacher.py)
+TEACHER_WEIGHTS = "teacher_4ch_22epochs_bs8.pth"  # or your existing teacher
 
 # Student checkpoints
 LOCAL_LATEST_STUDENT = "student_4ch_latest.pth"
@@ -122,8 +122,8 @@ def main():
         optimizer, T_max=NUM_EPOCHS
     )
 
-    # 6. AMP scaler
-    scaler = GradScaler('cuda')
+    # 6. AMP scaler  ✅ FIXED: no 'cuda' argument
+    scaler = GradScaler()
 
     print("--- [train_student_kd] Starting Knowledge Distillation training...")
 
@@ -181,7 +181,7 @@ def main():
                 teacher_feat_spatial.float()
             )
 
-            # Combine spatial + frequency feature KD (novel KD idea)
+            # Combine spatial + frequency feature KD (this is your novel KD idea)
             loss_feature = 0.5 * loss_feature_spatial + 0.5 * loss_feature_freq
             loss_freq    = loss_freq_out
 

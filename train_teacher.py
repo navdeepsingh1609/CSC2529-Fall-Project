@@ -26,21 +26,22 @@ from losses.frequency_loss import FFTAmplitudeLoss
 from losses.pixel_loss import CharbonnierLoss
 
 # ---------------- CONFIG ----------------
+# Full UDC-SIT dataset on Colab VM
 TRAIN_DIR = "/content/dataset/UDC-SIT/training"
 VAL_DIR   = "/content/dataset/UDC-SIT/validation"
 
 PATCH_SIZE = 256
 
-BATCH_SIZE = 8          # was 9; 8 is a bit safer for memory
-NUM_EPOCHS = 22         # full setting; if Colab is tight, you can drop to 16
+BATCH_SIZE = 8          # safe for A100
+NUM_EPOCHS = 22         # full run; can drop to ~16 if needed
 
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Local + Drive checkpoints
 LOCAL_CHECKPOINT_NAME = "teacher_4ch_latest.pth"
-FINAL_CHECKPOINT_NAME = "teacher_4ch_22epochs_bs8.pth"  # adjust name as you like
+FINAL_CHECKPOINT_NAME = "teacher_4ch_22epochs_bs8.pth"
 
-# Path on Google Drive to keep checkpoints safe
 DRIVE_CHECKPOINT_DIR = "/content/drive/MyDrive/Computational Imaging Project/checkpoints"
 os.makedirs(DRIVE_CHECKPOINT_DIR, exist_ok=True)
 DRIVE_LATEST_CKPT = os.path.join(DRIVE_CHECKPOINT_DIR, "teacher_latest.pth")
@@ -104,8 +105,8 @@ def main():
         optimizer, T_max=NUM_EPOCHS
     )
 
-    # 5. AMP scaler
-    scaler = GradScaler('cuda')
+    # 5. AMP scaler  ✅ FIXED: no 'cuda' argument
+    scaler = GradScaler()
 
     print("--- [train_teacher] Starting training...")
 
