@@ -31,16 +31,16 @@ TRAIN_DIR = "data/UDC-SIT_subset/train"
 VAL_DIR   = "data/UDC-SIT_subset/val"
 
 PATCH_SIZE = 256
-BATCH_SIZE = 16        # small but enough for quick test
+BATCH_SIZE = 16        # good for a quick sanity run
 LEARNING_RATE = 2e-4
-NUM_EPOCHS = 2         # just to test pipeline
+NUM_EPOCHS = 1         # just to test pipeline
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TEACHER_WEIGHTS = "teacher_quick_1epoch.pth"
 STUDENT_SAVE_PATH = "student_quick_1epoch.pth"
 
-# Loss weights (same structure as main, but this is just a quick run)
+# Loss weights
 W_PIXEL   = 1.0
 W_FEATURE = 0.5
 W_FREQ    = 0.2
@@ -100,9 +100,11 @@ def main():
     ).to(DEVICE)
     perceptual_loss_fn = lpips.LPIPS(net='vgg').to(DEVICE)
 
-    # 5. Optimizer (no scheduler for 1 epoch)
+    # 5. Optimizer
     optimizer = optim.Adam(student.parameters(), lr=LEARNING_RATE)
-    scaler = GradScaler('cuda')
+
+    # 6. AMP scaler — FIXED: no 'cuda' argument
+    scaler = GradScaler()
 
     print("--- [train_student_kd_quick] Starting quick KD training...")
 
