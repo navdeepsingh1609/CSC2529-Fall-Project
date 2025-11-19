@@ -1,168 +1,294 @@
 # File: eval_full_srgb.py
 """
-Evaluate paper-ready PSNR/SSIM/LPIPS in sRGB space.
-
-Requirements:
-- You have already converted:
-    GT  4-ch .npy -> sRGB PNGs (using visualize_sit.py)
-    Pred 4-ch .npy -> sRGB PNGs (same script)
-- Filenames of PNGs in GT and Pred dirs match (e.g., 0001.png, 0002.png, ...).
+Evaluate sRGB PSNR/SSIM using the official UDC-SIT ISP-style pipeline.
 
 This script:
-- Reads matching PNG pairs.
-- Computes PSNR, SSIM (sRGB) and LPIPS (VGG) for each image.
-- Saves a CSV of per-image metrics and a text summary.
-- Copies metrics to Google Drive.
+- Mimics utils/visualize_sit.py (background.dng + rawpy) to convert 4-ch Bayer .npy
+  into sRGB images.
+- For each model (teacher_full, student_full) and split (val, test if GT exists):
+    * Reads GT, input, and predicted 4-ch .npy.
+    * Converts each to sRGB with rawpy postprocess + crop.
+    * Computes PSNR and SSIM in sRGB space (uint8, data_range=255).
+- Saves per-image CSV and split-level summary, and copies results to Google Drive.
 
-Adjust GT_SRGB_DIR, PRED_SRGB_DIR, MODEL_NAME, SPLIT as needed.
+Assumptions:
+- Dataset:
+    VAL_DIR/input/*.npy, VAL_DIR/GT/*.npy
+    TEST_DIR/input/*.npy, TEST_DIR/GT/*.npy (if available)
+- Predictions from testing_full.py:
+    results_full/<model_name>_<split>/npy/*.npy
+- background.dng is present at BACKGROUND_DNG_PATH.
 """
 
 import os
+import sys
 import csv
-import numpy as np
 from glob import glob
 
+import numpy as np
 import torch
-import lpips
-import imageio.v2 as imageio
+import rawpy as rp
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 # ---------------- CONFIG ----------------
-# Example paths – change to your actual sRGB directory paths
-GT_SRGB_DIR   = "/content/dataset/UDC-SIT_srgb/testing/gt"
-PRED_SRGB_DIR = "results_full_srgb_images/student_testing"
+VAL_DIR  = "/content/dataset/UDC-SIT/validation"
+TEST_DIR = "/content/dataset/UDC-SIT/test"  # adjust if your test lives elsewhere
 
-MODEL_NAME = "student_full"
-SPLIT = "testing"
+PRED_ROOT = "results_full"
 
-RESULTS_ROOT = "results_full_srgb"
-DRIVE_RESULTS_ROOT = "/content/drive/MyDrive/Computational Imaging Project/results_full_srgb"
+# Models evaluated (must match names in testing_full.py)
+MODEL_NAMES = ["teacher_full", "student_full"]
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BACKGROUND_DNG_PATH = "background.dng"  # ensure this file exists in project root
+
+RESULTS_SRGB_ROOT = "results_full_srgb"
+DRIVE_RESULTS_SRGB_ROOT = "/content/drive/MyDrive/Computational Imaging Project/results_full_srgb"
 # ---------------------------------------
 
 
-def load_image_01(path):
+def tensor4ch_to_srgb_array(tensor_4ch, background_path):
     """
-    Load PNG and return float32 array in [0,1], shape (H, W, 3).
+    Replicate the core logic of utils/visualize_sit.save_4ch_npy_png,
+    but return the sRGB image as a numpy array instead of saving.
+
+    Args:
+        tensor_4ch: (4, H, W) torch.Tensor in [0,1]
+        background_path: path to background.dng
+
+    Returns:
+        srgb: (H_c, W_c, 3) np.ndarray, uint8 (after postprocess + crop)
     """
-    img = imageio.imread(path)
-    if img.ndim == 2:
-        img = np.stack([img, img, img], axis=-1)
-    if img.shape[2] == 4:  # RGBA -> RGB
-        img = img[:, :, :3]
+    # This fn_tonumpy matches visualize_sit.py
+    fn_tonumpy = lambda x: x.to("cpu").detach().numpy().transpose(0, 2, 1)
+    data = rp.imread(background_path)
 
-    if img.dtype == np.uint8:
-        img = img.astype(np.float32) / 255.0
-    else:
-        img = img.astype(np.float32)
-        img = np.clip(img, 0.0, 1.0)
-    return img
+    npy = fn_tonumpy(tensor_4ch.unsqueeze(0))  # -> (1, H, W) with some transpose shenanigans
+    npy = npy.squeeze() * 1023.0              # expected shape (4, ?, ?) after squeeze
+
+    # Extract Bayer planes from raw mosaic (views into raw_image)
+    GR = data.raw_image[0::2, 0::2]
+    R  = data.raw_image[0::2, 1::2]
+    B  = data.raw_image[1::2, 0::2]
+    GB = data.raw_image[1::2, 1::2]
+
+    # Reset them to zero (as in visualize_sit.py)
+    GR[:, :] = 0
+    R[:, :]  = 0
+    B[:, :]  = 0
+    GB[:, :] = 0
+
+    # Fill with our 4-channel data
+    w, h = npy.shape[1:]  # same as visualize_sit.py
+    GR[:w, :h] = npy[0][:w][:h]
+    R[:w,  :h] = npy[1][:w][:h]
+    B[:w,  :h] = npy[2][:w][:h]
+    GB[:w, :h] = npy[3][:w][:h]
+
+    # Run ISP and crop, as in visualize_sit.py
+    newData = data.postprocess()  # default 8-bit RGB
+    start = (0, 464)
+    end   = (3584, 3024)
+    newData = newData[start[0]:end[0], start[1]:end[1]]
+
+    return newData  # uint8, shape (H_c, W_c, 3)
 
 
-def main():
-    assert os.path.isdir(GT_SRGB_DIR),   f"Missing GT sRGB dir: {GT_SRGB_DIR}"
-    assert os.path.isdir(PRED_SRGB_DIR), f"Missing Pred sRGB dir: {PRED_SRGB_DIR}"
+def fourch_npy_to_srgb(npy_path, background_path):
+    """
+    Convenience wrapper: load (H,W,4) npy in [0,1023], convert to (4,H,W) tensor in [0,1],
+    then pass through tensor4ch_to_srgb_array.
 
-    os.makedirs(RESULTS_ROOT, exist_ok=True)
-    os.makedirs(DRIVE_RESULTS_ROOT, exist_ok=True)
+    Args:
+        npy_path: path to 4-ch .npy
+        background_path: path to background.dng
 
-    # We'll index images by the filenames in GT dir
-    gt_files = sorted(glob(os.path.join(GT_SRGB_DIR, "*.png")))
-    if not gt_files:
-        raise RuntimeError(f"No PNGs found in GT dir: {GT_SRGB_DIR}")
+    Returns:
+        srgb: (H_c, W_c, 3) uint8
+    """
+    img = np.load(npy_path).astype(np.float32) / 1023.0  # (H, W, 4)
+    tensor_4ch = torch.from_numpy(img).permute(2, 0, 1)  # (4, H, W)
+    tensor_4ch = torch.clamp(tensor_4ch, 0.0, 1.0)
+    return tensor4ch_to_srgb_array(tensor_4ch, background_path)
 
-    lpips_model = lpips.LPIPS(net='vgg').to(DEVICE)
+
+def evaluate_srgb_for_model_and_split(
+    model_name,
+    split_name,
+    data_dir,
+    pred_root,
+    background_path,
+    results_root,
+    drive_results_root,
+):
+    """
+    For a given model and split (val/test), compute sRGB PSNR/SSIM using the ISP
+    described in visualize_sit.py.
+
+    - Reads GT and input npy from data_dir.
+    - Reads predicted npy from pred_root/<model_name>_<split>/npy.
+    - Writes per-image CSV + summary, copies to Drive.
+
+    If GT is not available for this split, the function returns early.
+    """
+    input_dir = os.path.join(data_dir, "input")
+    gt_dir    = os.path.join(data_dir, "GT")
+
+    if not os.path.isdir(input_dir):
+        print(f"[eval_full_srgb] Split '{split_name}': missing input dir {input_dir}, skipping.")
+        return
+
+    if not os.path.isdir(gt_dir):
+        print(f"[eval_full_srgb] Split '{split_name}': missing GT dir {gt_dir}, skipping (no metrics).")
+        return
+
+    pred_npy_dir = os.path.join(pred_root, f"{model_name}_{split_name}", "npy")
+    if not os.path.isdir(pred_npy_dir):
+        print(f"[eval_full_srgb] Split '{split_name}': prediction dir not found: {pred_npy_dir}, skipping.")
+        return
+
+    input_files = sorted(glob(os.path.join(input_dir, "*.npy")))
+    if not input_files:
+        print(f"[eval_full_srgb] Split '{split_name}': no input .npy files in {input_dir}, skipping.")
+        return
+
+    print(f"\n=== [eval_full_srgb] Model: {model_name}, Split: {split_name} ===")
+    print(f"Data dir: {data_dir}")
+    print(f"Predictions dir: {pred_npy_dir}")
+    print(f"Num images: {len(input_files)}")
+
+    model_result_dir = os.path.join(results_root, f"{model_name}_{split_name}")
+    os.makedirs(model_result_dir, exist_ok=True)
+
+    metrics_csv_path = os.path.join(model_result_dir, "metrics_srgb.csv")
+    summary_path     = os.path.join(model_result_dir, "metrics_srgb_summary.txt")
 
     rows = []
-    psnr_list = []
-    ssim_list = []
-    lpips_list = []
+    psnr_in_list  = []
+    ssim_in_list  = []
+    psnr_pred_list  = []
+    ssim_pred_list  = []
 
-    for gt_path in gt_files:
-        base = os.path.basename(gt_path)
-        pred_path = os.path.join(PRED_SRGB_DIR, base)
+    for inp_path in input_files:
+        base = os.path.basename(inp_path)
+
+        gt_path   = os.path.join(gt_dir, base)
+        pred_path = os.path.join(pred_npy_dir, base)
+
+        if not os.path.exists(gt_path):
+            print(f"[eval_full_srgb] WARNING: GT not found for {base}, skipping.")
+            continue
         if not os.path.exists(pred_path):
-            print(f"WARNING: Pred PNG not found for {base}, skipping.")
+            print(f"[eval_full_srgb] WARNING: Prediction not found for {base}, skipping.")
             continue
 
-        gt_img   = load_image_01(gt_path)    # (H, W, 3)
-        pred_img = load_image_01(pred_path)  # (H, W, 3)
-        if gt_img.shape != pred_img.shape:
-            print(f"WARNING: Shape mismatch for {base}, skipping.")
+        # Convert input, GT, prediction to sRGB via ISP
+        srgb_inp  = fourch_npy_to_srgb(inp_path,  background_path)
+        srgb_gt   = fourch_npy_to_srgb(gt_path,   background_path)
+        srgb_pred = fourch_npy_to_srgb(pred_path, background_path)
+
+        # Ensure shapes match
+        if srgb_inp.shape != srgb_gt.shape or srgb_pred.shape != srgb_gt.shape:
+            print(f"[eval_full_srgb] WARNING: Shape mismatch for {base}, skipping.")
             continue
 
-        # PSNR & SSIM in sRGB [0,1]
-        psnr = peak_signal_noise_ratio(gt_img, pred_img, data_range=1.0)
-        ssim = structural_similarity(gt_img, pred_img, data_range=1.0, channel_axis=-1)
+        # PSNR/SSIM in sRGB (uint8, [0,255])
+        psnr_in  = peak_signal_noise_ratio(srgb_gt, srgb_inp,  data_range=255)
+        ssim_in  = structural_similarity(srgb_gt, srgb_inp,  data_range=255, channel_axis=-1)
 
-        # LPIPS (VGG) in [-1,1]
-        gt_t   = torch.from_numpy(gt_img).permute(2, 0, 1).unsqueeze(0).to(DEVICE)   # (1,3,H,W)
-        pred_t = torch.from_numpy(pred_img).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
-
-        gt_lp   = gt_t * 2 - 1
-        pred_lp = pred_t * 2 - 1
-
-        with torch.no_grad():
-            lpv = lpips_model(pred_lp, gt_lp).item()
+        psnr_pred = peak_signal_noise_ratio(srgb_gt, srgb_pred, data_range=255)
+        ssim_pred = structural_similarity(srgb_gt, srgb_pred, data_range=255, channel_axis=-1)
 
         rows.append({
             "filename": base,
-            "psnr_srgb": psnr,
-            "ssim_srgb": ssim,
-            "lpips_srgb": lpv,
+            "psnr_input_srgb": psnr_in,
+            "ssim_input_srgb": ssim_in,
+            "psnr_pred_srgb": psnr_pred,
+            "ssim_pred_srgb": ssim_pred,
         })
-        psnr_list.append(psnr)
-        ssim_list.append(ssim)
-        lpips_list.append(lpv)
 
-    if not rows:
-        raise RuntimeError("No valid GT/Pred pairs found; check your directories and filenames.")
-
-    metrics_csv_path = os.path.join(
-        RESULTS_ROOT, f"metrics_srgb_{MODEL_NAME}_{SPLIT}.csv"
-    )
-    summary_path = os.path.join(
-        RESULTS_ROOT, f"metrics_srgb_{MODEL_NAME}_{SPLIT}_summary.txt"
-    )
+        psnr_in_list.append(psnr_in)
+        ssim_in_list.append(ssim_in)
+        psnr_pred_list.append(psnr_pred)
+        ssim_pred_list.append(ssim_pred)
 
     # Write CSV
     with open(metrics_csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["filename", "psnr_srgb", "ssim_srgb", "lpips_srgb"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "filename",
+                "psnr_input_srgb",
+                "ssim_input_srgb",
+                "psnr_pred_srgb",
+                "ssim_pred_srgb",
+            ],
+        )
         writer.writeheader()
         for r in rows:
             writer.writerow(r)
 
-    mean_psnr  = float(np.mean(psnr_list))
-    mean_ssim  = float(np.mean(ssim_list))
-    mean_lpips = float(np.mean(lpips_list))
+    # Summary statistics
+    mean_psnr_in   = float(np.mean(psnr_in_list))   if psnr_in_list   else float("nan")
+    mean_ssim_in   = float(np.mean(ssim_in_list))   if ssim_in_list   else float("nan")
+    mean_psnr_pred = float(np.mean(psnr_pred_list)) if psnr_pred_list else float("nan")
+    mean_ssim_pred = float(np.mean(ssim_pred_list)) if ssim_pred_list else float("nan")
 
     with open(summary_path, "w") as f:
-        f.write(f"Model: {MODEL_NAME}\n")
-        f.write(f"Split: {SPLIT}\n")
-        f.write(f"Num images: {len(psnr_list)}\n\n")
-        f.write(f"Mean PSNR (sRGB): {mean_psnr:.4f} dB\n")
-        f.write(f"Mean SSIM (sRGB): {mean_ssim:.4f}\n")
-        f.write(f"Mean LPIPS (sRGB): {mean_lpips:.4f}\n")
+        f.write(f"Model: {model_name}\n")
+        f.write(f"Split: {split_name}\n")
+        f.write(f"Num images: {len(psnr_pred_list)}\n\n")
+        f.write(f"Mean PSNR (Input vs GT, sRGB): {mean_psnr_in:.4f} dB\n")
+        f.write(f"Mean SSIM (Input vs GT, sRGB): {mean_ssim_in:.4f}\n")
+        f.write(f"Mean PSNR (Pred vs GT, sRGB):  {mean_psnr_pred:.4f} dB\n")
+        f.write(f"Mean SSIM (Pred vs GT, sRGB):  {mean_ssim_pred:.4f}\n")
 
-    print("=== sRGB Evaluation Results ===")
-    print(f"Model: {MODEL_NAME}, Split: {SPLIT}")
-    print(f"Num images: {len(psnr_list)}")
-    print(f"Mean PSNR (sRGB): {mean_psnr:.4f} dB")
-    print(f"Mean SSIM (sRGB): {mean_ssim:.4f}")
-    print(f"Mean LPIPS (sRGB): {mean_lpips:.4f}")
+    print(f"\n--- [eval_full_srgb] {model_name} / {split_name} ---")
+    print(f"Mean PSNR (Input vs GT, sRGB): {mean_psnr_in:.4f} dB")
+    print(f"Mean SSIM (Input vs GT, sRGB): {mean_ssim_in:.4f}")
+    print(f"Mean PSNR (Pred vs GT, sRGB):  {mean_psnr_pred:.4f} dB")
+    print(f"Mean SSIM (Pred vs GT, sRGB):  {mean_ssim_pred:.4f}")
     print(f"Saved CSV to {metrics_csv_path}")
     print(f"Saved summary to {summary_path}")
 
-    # Copy metrics to Drive
+    # Copy to Drive
     import shutil
-    shutil.copy(metrics_csv_path,
-                os.path.join(DRIVE_RESULTS_ROOT,
-                             f"metrics_srgb_{MODEL_NAME}_{SPLIT}.csv"))
-    shutil.copy(summary_path,
-                os.path.join(DRIVE_RESULTS_ROOT,
-                             f"metrics_srgb_{MODEL_NAME}_{SPLIT}_summary.txt"))
-    print(f"Copied sRGB metrics to Drive: {DRIVE_RESULTS_ROOT}")
+    drive_model_dir = os.path.join(drive_results_root, f"{model_name}_{split_name}")
+    os.makedirs(drive_model_dir, exist_ok=True)
+    shutil.copy(metrics_csv_path, os.path.join(drive_model_dir, "metrics_srgb.csv"))
+    shutil.copy(summary_path,     os.path.join(drive_model_dir, "metrics_srgb_summary.txt"))
+    print(f"Copied sRGB metrics to Drive: {drive_model_dir}")
+
+
+def main():
+    if not os.path.exists(BACKGROUND_DNG_PATH):
+        raise FileNotFoundError(
+            f"background.dng not found at {BACKGROUND_DNG_PATH}. "
+            "Copy it here or update BACKGROUND_DNG_PATH."
+        )
+
+    os.makedirs(RESULTS_SRGB_ROOT, exist_ok=True)
+    os.makedirs(DRIVE_RESULTS_SRGB_ROOT, exist_ok=True)
+
+    splits = {
+        "val":  VAL_DIR,
+        "test": TEST_DIR,
+    }
+
+    for model_name in MODEL_NAMES:
+        for split_name, data_dir in splits.items():
+            if not data_dir or not os.path.isdir(data_dir):
+                print(f"[eval_full_srgb] Split '{split_name}' dir missing ({data_dir}), skipping.")
+                continue
+
+            evaluate_srgb_for_model_and_split(
+                model_name=model_name,
+                split_name=split_name,
+                data_dir=data_dir,
+                pred_root=PRED_ROOT,
+                background_path=BACKGROUND_DNG_PATH,
+                results_root=RESULTS_SRGB_ROOT,
+                drive_results_root=DRIVE_RESULTS_SRGB_ROOT,
+            )
 
 
 if __name__ == "__main__":
