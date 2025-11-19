@@ -75,23 +75,28 @@ def load_center_patch_4ch(npy_path, patch_size=256):
     return patch  # still in [0,1023]
 
 
-def bayer4_to_rgb_naive(bayer_4ch):
+def bayer4_to_rgb_balanced(bayer_4ch, r_gain=1.9, b_gain=1.9):
     """
-    Simple 'fake' demosaic just for visualization.
-    Assumes bayer_4ch has 4 channels: [GR, R, B, GB] and values in [0,1023].
-    Returns an RGB image in [0,1].
+    Simple demosaic-ish viewer:
+      - Treat channels as (GR, R, B, GB)
+      - G = average of GR and GB
+      - Apply a fixed gain to R and B to reduce green cast.
+
+    Input:  (H,W,4) or (4,H,W) in [0,1023] or [0,1]
+    Output: (H,W,3) in [0,1] for visualization / LPIPS.
     """
     arr = np.asarray(bayer_4ch, dtype=np.float32)
 
     if arr.ndim != 3:
         raise ValueError(f"Expected 3D array, got {arr.shape}")
 
-    if arr.shape[-1] == 4:
+    # Ensure we have (H,W,4)
+    if arr.shape[-1] == 4:        # (H,W,4)
         GR = arr[..., 0]
         R  = arr[..., 1]
         B  = arr[..., 2]
         GB = arr[..., 3]
-    elif arr.shape[0] == 4:
+    elif arr.shape[0] == 4:       # (4,H,W)
         GR = arr[0]
         R  = arr[1]
         B  = arr[2]
@@ -99,17 +104,18 @@ def bayer4_to_rgb_naive(bayer_4ch):
     else:
         raise ValueError(f"Expected shape (...,4), got {arr.shape}")
 
-    # Scale to [0,1] if needed
-    if arr.max() > 2.0:
+    # Scale to [0,1] if we're in [0,1023]
+    max_val = arr.max()
+    if max_val > 2.0:
         scale = 1023.0
     else:
         scale = 1.0
 
-    Rn = R / scale
-    Bn = B / scale
-    Gn = (GR + GB) / (2.0 * scale)
+    G  = (GR + GB) / (2.0 * scale)
+    Rn = (R / scale) * r_gain
+    Bn = (B / scale) * b_gain
 
-    rgb = np.stack([Rn, Gn, Bn], axis=-1)
+    rgb = np.stack([Rn, G, Bn], axis=-1)
     rgb = np.clip(rgb, 0.0, 1.0)
     return rgb
 
@@ -295,11 +301,11 @@ def evaluate_split(
         psnr_student = skimage.metrics.peak_signal_noise_ratio(gt_4n, student_4n, data_range=1.0)
         ssim_student = skimage.metrics.structural_similarity(gt_4n, student_4n, data_range=1.0, channel_axis=-1)
 
-        # 7) LPIPS on simple RGB projection
-        inp_rgb     = bayer4_to_rgb_naive(inp_patch_4ch)
-        gt_rgb      = bayer4_to_rgb_naive(gt_patch_4ch)
-        teacher_rgb = bayer4_to_rgb_naive(teacher_4n * 1023.0)
-        student_rgb = bayer4_to_rgb_naive(student_4n * 1023.0)
+        # 7) LPIPS on balanced RGB projection (same as your good script)
+        inp_rgb     = bayer4_to_rgb_balanced(inp_patch_4ch)
+        gt_rgb      = bayer4_to_rgb_balanced(gt_patch_4ch)
+        teacher_rgb = bayer4_to_rgb_balanced(teacher_4n * 1023.0)
+        student_rgb = bayer4_to_rgb_balanced(student_4n * 1023.0)
 
         gt_lp      = numpy_to_lpips_tensor(gt_rgb,      device)
         inp_lp     = numpy_to_lpips_tensor(inp_rgb,     device)
@@ -349,7 +355,7 @@ def evaluate_split(
             plot_gts.append(gt_rgb)
 
     # ============ Summary metrics ============
-    print(f"\n=== Per-image metrics for split: {split_name} (4-ch PSNR/SSIM + RGB LPIPS) ===")
+    print(f"\n=== Per-image metrics for split: {split_name} (4-ch PSNR/SSIM + balanced RGB LPIPS) ===")
     for res in results_per_image:
         print(f"\nImage: {res['id']}")
         print(f"  Input   -> PSNR: {res['psnr_input']:.2f}, SSIM: {res['ssim_input']:.4f}, LPIPS: {res['lpips_input']:.4f}")
