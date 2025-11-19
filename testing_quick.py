@@ -1,243 +1,294 @@
 # File: testing_quick.py
-import os, sys, glob, time
+"""
+Quick evaluation on the UDC-SIT subset (data/UDC-SIT_subset).
+
+- Loads full 4-ch .npy images from subset (train/val).
+- Tiles into 256x256 patches, runs model, reconstructs full image.
+- Computes PSNR, SSIM (Bayer domain) and LPIPS on simple RGB.
+- Saves metrics locally and copies CSV + summary to Google Drive.
+
+Assumptions:
+- Subset structure:
+    data/UDC-SIT_subset/
+        train/input/*.npy
+        train/gt/*.npy
+        val/input/*.npy
+        val/gt/*.npy
+- Each .npy is (H, W, 4) with values in [0, 1023].
+"""
+
+import os
+import sys
+import csv
 import numpy as np
+from glob import glob
+
 import torch
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import skimage.metrics
+from torch.cuda.amp import autocast
+
 import lpips
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+import imageio.v2 as imageio  # only needed if you add debugging PNGs
 
-# ===================== CONFIG (quick subset) =====================
-VAL_DIR = "data/UDC-SIT_subset/val"
-
-TEACHER_WEIGHTS_PATH = "teacher_quick_1epoch.pth"
-STUDENT_WEIGHTS_PATH = "student_quick_1epoch.pth"
-
-NUM_EXAMPLES = 5       # number of val images to test (<= 10)
-PATCH_SIZE = 256
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-PATCH_SAVE_DIR = "patch_outputs_quick"
-os.makedirs(PATCH_SAVE_DIR, exist_ok=True)
-# ===================================================
-
-# --- Make sure MambaIR is on sys.path ---
+# Add external MambaIR path if needed
 project_root = os.getcwd()
 mambair_path = os.path.join(project_root, 'models', 'external', 'MambaIR')
 if mambair_path not in sys.path:
     sys.path.insert(0, mambair_path)
-print(f"Added {mambair_path} to sys.path")
 
 from models.mambair_teacher import FrequencyAwareTeacher
 from models.unet_student import UNetStudent
 
-def load_center_patch_4ch(npy_path, patch_size=256):
-    arr = np.load(npy_path).astype(np.float32)   # (H,W,4)
-    H, W, C = arr.shape
-    ps = patch_size
-    r0 = (H - ps) // 2
-    c0 = (W - ps) // 2
-    r1, c1 = r0 + ps, c0 + ps
-    patch = arr[r0:r1, c0:c1, :]
-    return patch
+# ---------------- CONFIG ----------------
+SUBSET_ROOT = "data/UDC-SIT_subset"
+SPLIT = "val"           # "train" or "val"
+PATCH_SIZE = 256
+BATCH_SIZE = 8          # patches per forward pass
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def bayer4_to_rgb_naive(bayer_4ch):
-    arr = np.asarray(bayer_4ch, dtype=np.float32)
+# Which models to evaluate on subset
+MODEL_CONFIGS = [
+    {
+        "name": "teacher_quick",
+        "model_type": "teacher",
+        "weights": "teacher_quick_1epoch.pth",
+    },
+    {
+        "name": "student_quick",
+        "model_type": "student",
+        "weights": "student_quick_1epoch.pth",
+    },
+]
 
-    if arr.ndim != 3:
-        raise ValueError(f"Expected 3D array, got {arr.shape}")
+RESULTS_ROOT = "results_quick"
+DRIVE_RESULTS_ROOT = "/content/drive/MyDrive/Computational Imaging Project/results_quick"
 
-    if arr.shape[-1] == 4:
-        GR = arr[..., 0]
-        R  = arr[..., 1]
-        B  = arr[..., 2]
-        GB = arr[..., 3]
-    elif arr.shape[0] == 4:
-        GR = arr[0]
-        R  = arr[1]
-        B  = arr[2]
-        GB = arr[3]
-    else:
-        raise ValueError(f"Expected shape (...,4), got {arr.shape}")
+SAVE_NPY = True     # whether to save predicted 4-ch .npy full images
+NUM_EXAMPLES = None # None = all, or set an int for debug
+# ---------------------------------------
 
-    if arr.max() > 2.0:
-        scale = 1023.0
-    else:
-        scale = 1.0
 
-    Rn = R / scale
-    Bn = B / scale
-    Gn = (GR + GB) / (2.0 * scale)
+def load_full_npy_pair(input_path, gt_path):
+    """Load 4-ch full .npy (H, W, 4) → normalized torch tensors (4, H, W) in [0,1]."""
+    udc = np.load(input_path)  # (H, W, 4)
+    gt  = np.load(gt_path)
 
-    rgb = np.stack([Rn, Gn, Bn], axis=-1)
-    rgb = np.clip(rgb, 0.0, 1.0)
-    return rgb
+    assert udc.shape == gt.shape, f"Shape mismatch: {udc.shape} vs {gt.shape}"
 
-def numpy_to_lpips_tensor(img_np, device):
-    t = torch.from_numpy(img_np).float().to(device)
-    t = t.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
-    t = t * 2.0 - 1.0
-    return t
+    udc = torch.from_numpy(udc).permute(2, 0, 1).float() / 1023.0
+    gt  = torch.from_numpy(gt).permute(2, 0, 1).float() / 1023.0
+    return udc, gt  # (4, H, W), (4, H, W)
 
-print(f"Device: {DEVICE}")
-print("Loading models...")
 
-teacher = FrequencyAwareTeacher(in_channels=4, out_channels=4).to(DEVICE)
-teacher.load_state_dict(torch.load(TEACHER_WEIGHTS_PATH, map_location=DEVICE))
-teacher.eval()
-print(f"Loaded Teacher: {TEACHER_WEIGHTS_PATH}")
+def pad_to_multiple(tensor, patch_size):
+    """Pad CHW tensor so H,W are multiples of patch_size using reflect padding."""
+    _, H, W = tensor.shape
+    pad_h = (patch_size - H % patch_size) % patch_size
+    pad_w = (patch_size - W % patch_size) % patch_size
 
-student = UNetStudent(in_channels=4, out_channels=4).to(DEVICE)
-student.load_state_dict(torch.load(STUDENT_WEIGHTS_PATH, map_location=DEVICE))
-student.eval()
-print(f"Loaded Student: {STUDENT_WEIGHTS_PATH}")
+    if pad_h == 0 and pad_w == 0:
+        return tensor, H, W
 
-lpips_model = lpips.LPIPS(net='vgg').to(DEVICE)
+    padded = F.pad(tensor, (0, pad_w, 0, pad_h), mode="reflect")  # (C, H+pad_h, W+pad_w)
+    return padded, H, W
 
-input_paths = sorted(glob.glob(os.path.join(VAL_DIR, "input", "*.npy")))
-if not input_paths:
-    raise RuntimeError(f"No .npy files found in {os.path.join(VAL_DIR, 'input')}")
 
-input_paths = input_paths[:min(NUM_EXAMPLES, len(input_paths))]
-print("\nUsing validation images:")
-for p in input_paths:
-    print("  ", os.path.basename(p))
-
-results_per_image = []
-
-plot_inputs   = []
-plot_teachers = []
-plot_students = []
-plot_gts      = []
-
-for idx, input_path in enumerate(input_paths):
-    img_id = os.path.splitext(os.path.basename(input_path))[0]
-    gt_path = input_path.replace("/input/", "/GT/")
-
-    print(f"\n[{idx+1}/{len(input_paths)}] Image ID: {img_id}")
-
-    # 1) Load center patches (H,W,4) in [0,1023]
-    inp_patch_4ch = load_center_patch_4ch(input_path, PATCH_SIZE)
-    gt_patch_4ch  = load_center_patch_4ch(gt_path,    PATCH_SIZE)
-
-    # 2) Normalize to [0,1]
-    inp_norm = (inp_patch_4ch / 1023.0).astype(np.float32)
-    gt_norm  = (gt_patch_4ch  / 1023.0).astype(np.float32)
-
-    inp_chw = np.transpose(inp_norm, (2, 0, 1))  # (4,H,W)
-    gt_chw  = np.transpose(gt_norm,  (2, 0, 1))
-
-    inp_bchw = torch.from_numpy(inp_chw).unsqueeze(0).to(DEVICE)
-    gt_bchw  = torch.from_numpy(gt_chw).unsqueeze(0).to(DEVICE)
-
-    # 3) Forward through models
-    with torch.no_grad():
-        t_start = time.time()
-        teacher_out_bchw, _, _ = teacher(inp_bchw)
-        t_time = time.time() - t_start
-
-        t_start = time.time()
-        student_out_bchw, _ = student(inp_bchw)
-        s_time = time.time() - t_start
-
-    # 4) Clamp outputs to [0,1] for metrics and visualization
-    teacher_out_bchw = torch.clamp(teacher_out_bchw, 0.0, 1.0)
-    student_out_bchw = torch.clamp(student_out_bchw, 0.0, 1.0)
-
-    # 5) Back to numpy (H,W,4) in [0,1]
-    inp_4n     = inp_norm
-    gt_4n      = gt_norm
-    teacher_4n = teacher_out_bchw.squeeze(0).permute(1, 2, 0).cpu().numpy()
-    student_4n = student_out_bchw.squeeze(0).permute(1, 2, 0).cpu().numpy()
-
-    # 6) 4-channel PSNR/SSIM
-    psnr_input   = skimage.metrics.peak_signal_noise_ratio(gt_4n, inp_4n, data_range=1.0)
-    ssim_input   = skimage.metrics.structural_similarity(gt_4n, inp_4n, data_range=1.0, channel_axis=-1)
-
-    psnr_teacher = skimage.metrics.peak_signal_noise_ratio(gt_4n, teacher_4n, data_range=1.0)
-    ssim_teacher = skimage.metrics.structural_similarity(gt_4n, teacher_4n, data_range=1.0, channel_axis=-1)
-
-    psnr_student = skimage.metrics.peak_signal_noise_ratio(gt_4n, student_4n, data_range=1.0)
-    ssim_student = skimage.metrics.structural_similarity(gt_4n, student_4n, data_range=1.0, channel_axis=-1)
-
-    # 7) LPIPS on naive RGB
-    inp_rgb     = bayer4_to_rgb_naive(inp_patch_4ch)
-    gt_rgb      = bayer4_to_rgb_naive(gt_patch_4ch)
-    teacher_rgb = bayer4_to_rgb_naive(teacher_4n * 1023.0)
-    student_rgb = bayer4_to_rgb_naive(student_4n * 1023.0)
-
-    gt_lp      = numpy_to_lpips_tensor(gt_rgb,      DEVICE)
-    inp_lp     = numpy_to_lpips_tensor(inp_rgb,     DEVICE)
-    teacher_lp = numpy_to_lpips_tensor(teacher_rgb, DEVICE)
-    student_lp = numpy_to_lpips_tensor(student_rgb, DEVICE)
+def run_model_on_full_image(model, udc_full_4ch, patch_size, batch_size):
+    """
+    Run model on full 4-ch image by tiling into non-overlapping patches.
+    udc_full_4ch: (4, H, W) tensor in [0,1].
+    Returns: pred_full_4ch: (4, H, W) tensor in [0,1].
+    """
+    device = next(model.parameters()).device
+    model.eval()
 
     with torch.no_grad():
-        lpips_input   = lpips_model(gt_lp, inp_lp).item()
-        lpips_teacher = lpips_model(gt_lp, teacher_lp).item()
-        lpips_student = lpips_model(gt_lp, student_lp).item()
+        x, H_orig, W_orig = pad_to_multiple(udc_full_4ch, patch_size)
+        C, H_pad, W_pad = x.shape
 
-    # 8) Save metrics
-    results_per_image.append({
-        "id": img_id,
-        "psnr_input": psnr_input,
-        "ssim_input": ssim_input,
-        "lpips_input": lpips_input,
+        x = x.unsqueeze(0)  # (1, C, H_pad, W_pad) to keep things simple
 
-        "psnr_teacher": psnr_teacher,
-        "ssim_teacher": ssim_teacher,
-        "lpips_teacher": lpips_teacher,
-        "time_teacher": t_time,
+        # Prepare patch coordinates
+        ys = list(range(0, H_pad, patch_size))
+        xs = list(range(0, W_pad, patch_size))
+        coords = [(y, x_) for y in ys for x_ in xs]
 
-        "psnr_student": psnr_student,
-        "ssim_student": ssim_student,
-        "lpips_student": lpips_student,
-        "time_student": s_time,
-    })
+        pred_full = torch.zeros_like(x)
 
-    print(f"  Input   -> PSNR: {psnr_input:.2f}, SSIM: {ssim_input:.4f}, LPIPS: {lpips_input:.4f}")
-    print(f"  Teacher -> PSNR: {psnr_teacher:.2f}, SSIM: {ssim_teacher:.4f}, LPIPS: {lpips_teacher:.4f}, Time: {t_time*1000:.2f} ms")
-    print(f"  Student -> PSNR: {psnr_student:.2f}, SSIM: {ssim_student:.4f}, LPIPS: {lpips_student:.4f}, Time: {s_time*1000:.2f} ms")
+        # Process patches in batches
+        for i in range(0, len(coords), batch_size):
+            batch_coords = coords[i:i + batch_size]
+            patches = []
+            for (y, x_) in batch_coords:
+                patch = x[:, :, y:y + patch_size, x_:x_ + patch_size]  # (1, 4, ps, ps)
+                patches.append(patch)
+            patches = torch.cat(patches, dim=0).to(device)  # (B, 4, ps, ps)
 
-    # store for plotting
-    plot_inputs.append(inp_rgb)
-    plot_teachers.append(teacher_rgb)
-    plot_students.append(student_rgb)
-    plot_gts.append(gt_rgb)
+            with autocast():
+                out, *_ = model(patches)  # (B, 4, ps, ps)
 
-# ============ Plot grid ============
+            out = out.detach().cpu()
 
-rows = len(results_per_image)
-cols = 4
-fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
+            # Write back into full canvas
+            for b, (y, x_) in enumerate(batch_coords):
+                pred_full[:, :, y:y + patch_size, x_:x_ + patch_size] = out[b:b + 1]
 
-if rows == 1:
-    axes = np.expand_dims(axes, axis=0)
+        pred_full = pred_full[:, :, :H_orig, :W_orig]  # crop
+        return pred_full.squeeze(0)  # (4, H_orig, W_orig)
 
-for i, res in enumerate(results_per_image):
-    img_id = res["id"]
 
-    axes[i, 0].imshow(plot_inputs[i])
-    axes[i, 0].set_title(f"{img_id} - Input")
-    axes[i, 0].axis("off")
+def compute_metrics_bayer_and_lpips(pred_4ch, gt_4ch, lpips_model):
+    """
+    pred_4ch, gt_4ch: (4, H, W) tensors in [0,1].
+    Returns: psnr, ssim, lpips_rgb
+    """
+    # Bayer-domain PSNR/SSIM
+    pred_np = pred_4ch.permute(1, 2, 0).cpu().numpy()
+    gt_np   = gt_4ch.permute(1, 2, 0).cpu().numpy()
 
-    axes[i, 1].imshow(plot_teachers[i])
-    axes[i, 1].set_title("Teacher")
-    axes[i, 1].axis("off")
+    psnr = peak_signal_noise_ratio(gt_np, pred_np, data_range=1.0)
+    ssim = structural_similarity(gt_np, pred_np, data_range=1.0, channel_axis=-1)
 
-    axes[i, 2].imshow(plot_students[i])
-    axes[i, 2].set_title("Student")
-    axes[i, 2].axis("off")
+    # LPIPS on pseudo-RGB (first 3 channels)
+    pred_rgb = pred_4ch[:3, :, :].unsqueeze(0)  # (1, 3, H, W)
+    gt_rgb   = gt_4ch[:3, :, :].unsqueeze(0)
+    # Scale to [-1,1] for LPIPS
+    pred_rgb_lp = pred_rgb * 2 - 1
+    gt_rgb_lp   = gt_rgb   * 2 - 1
 
-    axes[i, 3].imshow(plot_gts[i])
-    axes[i, 3].set_title("GT")
-    axes[i, 3].axis("off")
+    with torch.no_grad():
+        lp = lpips_model(pred_rgb_lp, gt_rgb_lp).item()
 
-plt.tight_layout()
-plt.show()
+    return psnr, ssim, lp
 
-print("\n\n=== Per-image metrics (4-ch PSNR/SSIM + RGB LPIPS) ===")
-for res in results_per_image:
-    print(f"\nImage: {res['id']}")
-    print(f"  Input   -> PSNR: {res['psnr_input']:.2f}, SSIM: {res['ssim_input']:.4f}, LPIPS: {res['lpips_input']:.4f}")
-    print(f"  Teacher -> PSNR: {res['psnr_teacher']:.2f}, SSIM: {res['ssim_teacher']:.4f}, LPIPS: {res['lpips_teacher']:.4f}, Time: {res['time_teacher']*1000:.2f} ms")
-    print(f"  Student -> PSNR: {res['psnr_student']:.2f}, SSIM: {res['ssim_student']:.4f}, LPIPS: {res['lpips_student']:.4f}, Time: {res['time_student']*1000:.2f} ms")
+
+def main():
+    input_dir = os.path.join(SUBSET_ROOT, SPLIT, "input")
+    gt_dir    = os.path.join(SUBSET_ROOT, SPLIT, "gt")
+
+    assert os.path.isdir(input_dir), f"Missing input dir: {input_dir}"
+    assert os.path.isdir(gt_dir),    f"Missing gt dir: {gt_dir}"
+
+    input_files = sorted(glob(os.path.join(input_dir, "*.npy")))
+    if NUM_EXAMPLES is not None:
+        input_files = input_files[:NUM_EXAMPLES]
+
+    print(f"--- [testing_quick] Split: {SPLIT}, Num images: {len(input_files)}")
+
+    os.makedirs(RESULTS_ROOT, exist_ok=True)
+    os.makedirs(DRIVE_RESULTS_ROOT, exist_ok=True)
+
+    lpips_model = lpips.LPIPS(net='vgg').to(DEVICE)
+
+    for cfg in MODEL_CONFIGS:
+        model_name = cfg["name"]
+        model_type = cfg["model_type"]
+        weights    = cfg["weights"]
+
+        if not os.path.exists(weights):
+            print(f"--- [testing_quick] Skipping {model_name}, weights not found: {weights}")
+            continue
+
+        print(f"\n=== Evaluating {model_name} ({model_type}) on subset {SPLIT} ===")
+
+        # Build model
+        if model_type == "teacher":
+            model = FrequencyAwareTeacher(in_channels=4, out_channels=4).to(DEVICE)
+        elif model_type == "student":
+            model = UNetStudent(in_channels=4, out_channels=4).to(DEVICE)
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+        model.load_state_dict(torch.load(weights, map_location=DEVICE))
+        model.eval()
+
+        # Output dirs
+        model_result_dir = os.path.join(RESULTS_ROOT, f"{model_name}_{SPLIT}")
+        os.makedirs(model_result_dir, exist_ok=True)
+
+        if SAVE_NPY:
+            npy_out_dir = os.path.join(model_result_dir, "npy")
+            os.makedirs(npy_out_dir, exist_ok=True)
+        else:
+            npy_out_dir = None
+
+        metrics_csv_path = os.path.join(model_result_dir, "metrics_patch.csv")
+        summary_path     = os.path.join(model_result_dir, "metrics_summary.txt")
+
+        # Metrics accumulators
+        rows = []
+        psnr_list = []
+        ssim_list = []
+        lpips_list = []
+
+        for inp_path in input_files:
+            base = os.path.basename(inp_path)
+            gt_path = os.path.join(gt_dir, base)
+            if not os.path.exists(gt_path):
+                print(f"WARNING: GT not found for {base}, skipping.")
+                continue
+
+            udc_full, gt_full = load_full_npy_pair(inp_path, gt_path)
+            udc_full = udc_full.to(DEVICE)
+
+            # Run model
+            pred_full = run_model_on_full_image(
+                model, udc_full, patch_size=PATCH_SIZE, batch_size=BATCH_SIZE
+            ).cpu()
+
+            if SAVE_NPY and npy_out_dir is not None:
+                out_npy_path = os.path.join(npy_out_dir, base)
+                np.save(out_npy_path, pred_full.permute(1, 2, 0).numpy())  # (H, W, 4)
+
+            # Metrics
+            psnr, ssim, lpv = compute_metrics_bayer_and_lpips(pred_full, gt_full, lpips_model)
+
+            rows.append({
+                "filename": base,
+                "psnr_bayer": psnr,
+                "ssim_bayer": ssim,
+                "lpips_rgb": lpv
+            })
+            psnr_list.append(psnr)
+            ssim_list.append(ssim)
+            lpips_list.append(lpv)
+
+        # Write CSV
+        with open(metrics_csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["filename", "psnr_bayer", "ssim_bayer", "lpips_rgb"])
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+
+        # Summary
+        mean_psnr  = float(np.mean(psnr_list)) if psnr_list else float("nan")
+        mean_ssim  = float(np.mean(ssim_list)) if ssim_list else float("nan")
+        mean_lpips = float(np.mean(lpips_list)) if lpips_list else float("nan")
+
+        with open(summary_path, "w") as f:
+            f.write(f"Model: {model_name}\n")
+            f.write(f"Split: {SPLIT}\n")
+            f.write(f"Num images: {len(psnr_list)}\n\n")
+            f.write(f"Mean PSNR (Bayer): {mean_psnr:.4f} dB\n")
+            f.write(f"Mean SSIM (Bayer): {mean_ssim:.4f}\n")
+            f.write(f"Mean LPIPS (RGB):  {mean_lpips:.4f}\n")
+
+        print(f"--- [testing_quick] {model_name} results:")
+        print(f"Mean PSNR (Bayer): {mean_psnr:.4f} dB")
+        print(f"Mean SSIM (Bayer): {mean_ssim:.4f}")
+        print(f"Mean LPIPS (RGB):  {mean_lpips:.4f}")
+        print(f"Saved CSV to {metrics_csv_path}")
+        print(f"Saved summary to {summary_path}")
+
+        # Copy CSV + summary to Drive
+        drive_model_dir = os.path.join(DRIVE_RESULTS_ROOT, f"{model_name}_{SPLIT}")
+        os.makedirs(drive_model_dir, exist_ok=True)
+        import shutil
+        shutil.copy(metrics_csv_path, os.path.join(drive_model_dir, "metrics_patch.csv"))
+        shutil.copy(summary_path,     os.path.join(drive_model_dir, "metrics_summary.txt"))
+        print(f"Copied metrics to Drive: {drive_model_dir}")
+
+
+if __name__ == "__main__":
+    main()

@@ -25,7 +25,7 @@ print(f"--- [train_student_kd] Added {mambair_path} to sys.path")
 from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
 from models.unet_student import UNetStudent
-from losses.frequency_loss import FFTAmplitudeLoss
+from losses.frequency_loss import FFTAmpPhaseMultiScaleLoss
 from losses.pixel_loss import CharbonnierLoss
 
 # ---------------- CONFIG ----------------
@@ -34,9 +34,9 @@ VAL_DIR   = "/content/dataset/UDC-SIT/validation"
 
 PATCH_SIZE = 256
 
-BATCH_SIZE    = 64          # you verified this fits for student
+BATCH_SIZE    = 64
 LEARNING_RATE = 2e-4
-NUM_EPOCHS    = 20          # adjust if needed
+NUM_EPOCHS    = 20
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
 TEACHER_WEIGHTS = "teacher_4ch_22epochs_bs8.pth"
@@ -58,7 +58,7 @@ DRIVE_LOSS_PLOT    = os.path.join(DRIVE_CHECKPOINT_DIR, "student_loss_curves_ful
 # Loss weights
 W_PIXEL   = 1.0
 W_FEATURE = 0.5    # spatial + freq KD
-W_FREQ    = 0.2    # output-level freq KD
+W_FREQ    = 0.3    # AP+multi-scale KD on outputs
 W_LPIPS   = 0.1
 # --------------------------------------
 
@@ -72,6 +72,7 @@ print(f"Teacher Weights: {TEACHER_WEIGHTS}")
 print(f"Local latest student ckpt: {LOCAL_LATEST_STUDENT}")
 print(f"Drive latest student ckpt: {DRIVE_LATEST_STUDENT}")
 print("-----------------------------------\n")
+
 
 def main():
     # 1. Data
@@ -111,12 +112,15 @@ def main():
 
     # 4. Losses
     print("--- [train_student_kd] Initializing losses...")
-    pixel_loss_fn     = CharbonnierLoss().to(DEVICE)
-    feature_loss_fn   = nn.L1Loss().to(DEVICE)
-    frequency_loss_fn = FFTAmplitudeLoss(
+    pixel_loss_fn      = CharbonnierLoss().to(DEVICE)
+    feature_loss_fn    = nn.L1Loss().to(DEVICE)
+    frequency_loss_fn  = FFTAmpPhaseMultiScaleLoss(
         loss_weight=1.0,
         focus_low_freq=True,
-        cutoff=0.25
+        cutoff=0.25,
+        lambda_amp=1.0,
+        lambda_phase=0.5,
+        scales=(1.0, 0.5)
     ).to(DEVICE)
     perceptual_loss_fn = lpips.LPIPS(net='vgg').to(DEVICE)
 
@@ -155,10 +159,10 @@ def main():
             with autocast():
                 student_out_4ch, student_features_raw = student(udc_batch)
 
-                # 1) Pixel loss
+                # 1) Pixel loss (raw 4-ch)
                 loss_pixel = pixel_loss_fn(student_out_4ch, gt_batch)
 
-                # 2) Spatial feature KD
+                # 2) Spatial feature KD (L1)
                 student_features = F.interpolate(
                     student_features_raw,
                     size=teacher_feat_spatial.shape[2:],
@@ -167,7 +171,7 @@ def main():
                 )
                 loss_feature_spatial = feature_loss_fn(student_features, teacher_feat_spatial)
 
-                # 3) LPIPS
+                # 3) LPIPS in pseudo-RGB (first 3 channels)
                 pred_rgb_slice = student_out_4ch[:, :3, :, :]
                 gt_rgb_slice   = gt_batch[:, :3, :, :]
                 loss_lpips = perceptual_loss_fn(
@@ -175,16 +179,17 @@ def main():
                     gt_rgb_slice   * 2 - 1
                 ).mean()
 
-            # 4) Frequency-based KD (float32)
+            # 4) Frequency-based KD (amplitude + phase, multi-scale)
             loss_freq_out = frequency_loss_fn(
-                student_out_4ch.float(),
-                teacher_out_4ch.float()
+                student_out_4ch.detach(),
+                teacher_out_4ch.detach()
             )
             loss_feature_freq = frequency_loss_fn(
-                student_features.float(),
-                teacher_feat_spatial.float()
+                student_features.detach(),
+                teacher_feat_spatial.detach()
             )
 
+            # Combine spatial + freq feature KD
             loss_feature = 0.5 * loss_feature_spatial + 0.5 * loss_feature_freq
             loss_freq    = loss_freq_out
 
@@ -202,7 +207,7 @@ def main():
         avg_train_loss = train_loss / len(train_loader)
         print(f"--- [train_student_kd] Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
 
-        # Validation
+        # Validation (Charbonnier only)
         student.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -274,6 +279,7 @@ def main():
         print(f"Saved loss curves plot to {LOSS_PLOT_PNG} and {DRIVE_LOSS_PLOT}")
     except Exception as e:
         print(f"Could not copy loss plot to Drive: {e}")
+
 
 if __name__ == "__main__":
     main()

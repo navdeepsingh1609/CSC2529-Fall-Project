@@ -25,7 +25,7 @@ print(f"--- [train_student_kd_quick] Added {mambair_path} to sys.path")
 from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
 from models.unet_student import UNetStudent
-from losses.frequency_loss import FFTAmplitudeLoss
+from losses.frequency_loss import FFTAmpPhaseMultiScaleLoss
 from losses.pixel_loss import CharbonnierLoss
 
 # ---------------- CONFIG (subset) ----------------
@@ -47,7 +47,7 @@ LOSS_PLOT_PNG     = "student_quick_loss_curves.png"
 # Loss weights
 W_PIXEL   = 1.0
 W_FEATURE = 0.5
-W_FREQ    = 0.2
+W_FREQ    = 0.3
 W_LPIPS   = 0.1
 # ------------------------------------------------
 
@@ -60,6 +60,7 @@ print(f"Device: {DEVICE}")
 print(f"Teacher Weights: {TEACHER_WEIGHTS}")
 print(f"Student Save Path: {STUDENT_SAVE_PATH}")
 print("-----------------------------------\n")
+
 
 def main():
     # 1. Data
@@ -95,12 +96,15 @@ def main():
     student = UNetStudent(in_channels=4, out_channels=4).to(DEVICE)
 
     # 4. Losses
-    pixel_loss_fn     = CharbonnierLoss().to(DEVICE)
-    feature_loss_fn   = nn.L1Loss().to(DEVICE)
-    frequency_loss_fn = FFTAmplitudeLoss(
+    pixel_loss_fn      = CharbonnierLoss().to(DEVICE)
+    feature_loss_fn    = nn.L1Loss().to(DEVICE)
+    frequency_loss_fn  = FFTAmpPhaseMultiScaleLoss(
         loss_weight=1.0,
         focus_low_freq=True,
-        cutoff=0.25
+        cutoff=0.25,
+        lambda_amp=1.0,
+        lambda_phase=0.5,
+        scales=(1.0, 0.5)
     ).to(DEVICE)
     perceptual_loss_fn = lpips.LPIPS(net='vgg').to(DEVICE)
 
@@ -154,12 +158,12 @@ def main():
 
             # Freq KD
             loss_freq_out = frequency_loss_fn(
-                student_out_4ch.float(),
-                teacher_out_4ch.float()
+                student_out_4ch.detach(),
+                teacher_out_4ch.detach()
             )
             loss_feature_freq = frequency_loss_fn(
-                student_features.float(),
-                teacher_feat_spatial.float()
+                student_features.detach(),
+                teacher_feat_spatial.detach()
             )
 
             loss_feature = 0.5 * loss_feature_spatial + 0.5 * loss_feature_freq
@@ -222,6 +226,7 @@ def main():
     fig.savefig(LOSS_PLOT_PNG, dpi=150)
     plt.close(fig)
     print(f"Saved quick loss plot to {LOSS_PLOT_PNG}")
+
 
 if __name__ == "__main__":
     main()

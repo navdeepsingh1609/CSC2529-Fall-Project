@@ -24,7 +24,7 @@ print(f"--- [train_teacher] Added {mambair_path} to sys.path")
 
 from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
-from losses.frequency_loss import FFTAmplitudeLoss
+from losses.frequency_loss import FFTAmpPhaseMultiScaleLoss
 from losses.pixel_loss import CharbonnierLoss
 
 # ---------------- CONFIG ----------------
@@ -33,8 +33,8 @@ VAL_DIR   = "/content/dataset/UDC-SIT/validation"
 
 PATCH_SIZE = 256
 
-BATCH_SIZE   = 8          # safe for A100
-NUM_EPOCHS   = 22         # adjust if you need budget
+BATCH_SIZE   = 8          # safe for A100 / decent GPUs
+NUM_EPOCHS   = 22
 LEARNING_RATE = 1e-4
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -56,7 +56,7 @@ DRIVE_LOSS_PLOT    = os.path.join(DRIVE_CHECKPOINT_DIR, "teacher_loss_curves_ful
 # Loss weights
 W_PIXEL      = 1.0
 W_PERCEPTUAL = 0.1
-W_FFT        = 0.05
+W_FFT        = 0.05   # AP+multi-scale FFT loss
 # ----------------------------------------
 
 print("\n--- [train_teacher] Configuration ---")
@@ -68,6 +68,7 @@ print(f"Device: {DEVICE}")
 print(f"Local latest ckpt: {LOCAL_CHECKPOINT_NAME}")
 print(f"Drive latest ckpt: {DRIVE_LATEST_CKPT}")
 print("-----------------------------------\n")
+
 
 def main():
     # 1. Data
@@ -99,10 +100,13 @@ def main():
     print("--- [train_teacher] Initializing losses...")
     pixel_loss_fn      = CharbonnierLoss().to(DEVICE)
     perceptual_loss_fn = lpips.LPIPS(net='vgg').to(DEVICE)
-    fft_loss_fn        = FFTAmplitudeLoss(
+    fft_loss_fn        = FFTAmpPhaseMultiScaleLoss(
         loss_weight=1.0,
         focus_low_freq=True,
-        cutoff=0.25
+        cutoff=0.25,
+        lambda_amp=1.0,
+        lambda_phase=0.5,
+        scales=(1.0, 0.5)
     ).to(DEVICE)
 
     # 4. Optimizer + scheduler
@@ -134,10 +138,10 @@ def main():
             with autocast():
                 pred_batch_4ch, _, _ = model(udc_batch)
 
-                # Charbonnier pixel loss
+                # Charbonnier pixel loss in raw Bayer domain
                 loss_pixel = pixel_loss_fn(pred_batch_4ch, gt_batch)
 
-                # LPIPS on pseudo-RGB (first 3 channels)
+                # LPIPS on pseudo-RGB (first 3 channels scaled to [-1, 1])
                 pred_rgb = pred_batch_4ch[:, :3, :, :]
                 gt_rgb   = gt_batch[:, :3, :, :]
                 loss_perceptual = perceptual_loss_fn(
@@ -145,12 +149,12 @@ def main():
                     gt_rgb   * 2 - 1
                 ).mean()
 
-            # Frequency-domain loss (float32)
-            loss_fft = fft_loss_fn(pred_batch_4ch.float(), gt_batch.float())
+            # Frequency-domain loss (amplitude + phase, multi-scale)
+            loss_fft = fft_loss_fn(pred_batch_4ch.detach(), gt_batch.detach())
 
-            total_loss = (W_PIXEL * loss_pixel) + \
+            total_loss = (W_PIXEL      * loss_pixel) + \
                          (W_PERCEPTUAL * loss_perceptual) + \
-                         (W_FFT * loss_fft)
+                         (W_FFT        * loss_fft)
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -161,7 +165,7 @@ def main():
         avg_train_loss = train_loss / len(train_loader)
         print(f"--- [train_teacher] Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
 
-        # Validation
+        # Validation (Charbonnier only on raw patches)
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -232,6 +236,7 @@ def main():
         print(f"Saved loss curves plot to {LOSS_PLOT_PNG} and {DRIVE_LOSS_PLOT}")
     except Exception as e:
         print(f"Could not copy loss plot to Drive: {e}")
+
 
 if __name__ == "__main__":
     main()

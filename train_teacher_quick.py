@@ -23,7 +23,7 @@ print(f"--- [train_teacher_quick] Added {mambair_path} to sys.path")
 
 from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
-from losses.frequency_loss import FFTAmplitudeLoss
+from losses.frequency_loss import FFTAmpPhaseMultiScaleLoss
 from losses.pixel_loss import CharbonnierLoss
 
 # ---------------- CONFIG (subset) ----------------
@@ -49,6 +49,7 @@ print(f"Epochs: {NUM_EPOCHS}, Learning Rate: {LEARNING_RATE}")
 print(f"Device: {DEVICE}")
 print(f"Checkpoint: {CHECKPOINT_NAME}")
 print("-----------------------------------\n")
+
 
 def main():
     # Data
@@ -76,10 +77,13 @@ def main():
     # Losses
     pixel_loss_fn      = CharbonnierLoss().to(DEVICE)
     perceptual_loss_fn = lpips.LPIPS(net='vgg').to(DEVICE)
-    fft_loss_fn        = FFTAmplitudeLoss(
+    fft_loss_fn        = FFTAmpPhaseMultiScaleLoss(
         loss_weight=1.0,
         focus_low_freq=True,
-        cutoff=0.25
+        cutoff=0.25,
+        lambda_amp=1.0,
+        lambda_phase=0.5,
+        scales=(1.0, 0.5)
     ).to(DEVICE)
 
     # Optimizer + AMP
@@ -113,7 +117,7 @@ def main():
                     gt_rgb   * 2 - 1
                 ).mean()
 
-            loss_fft = fft_loss_fn(pred_batch_4ch.float(), gt_batch.float())
+            loss_fft = fft_loss_fn(pred_batch_4ch.detach(), gt_batch.detach())
 
             total_loss = loss_pixel + 0.1 * loss_perceptual + 0.05 * loss_fft
 
@@ -170,6 +174,7 @@ def main():
     fig.savefig(LOSS_PLOT_PNG, dpi=150)
     plt.close(fig)
     print(f"Saved quick loss plot to {LOSS_PLOT_PNG}")
+
 
 if __name__ == "__main__":
     main()
