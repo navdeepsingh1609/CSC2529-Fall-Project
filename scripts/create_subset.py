@@ -5,7 +5,7 @@ import shutil
 # --- Config ---
 # Point SOURCE_DIR to the EXTRACTED dataset location on Colab local disk
 # after you untar into /content/dataset/UDC-SIT.
-SOURCE_DIR = "/content/dataset/UDC-SIT"
+SOURCE_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT"
 
 # Target paths (where the small subset will be)
 TARGET_DIR = "data/UDC-SIT_subset"
