@@ -7,4 +7,12 @@ timm
 einops
 fvcore
 scikit-learn
+scikit-image
+imageio
 rawpy
+pandas
+
+# MambaIR & dependencies
+basicsr
+mamba-ssm
+causal-conv1d

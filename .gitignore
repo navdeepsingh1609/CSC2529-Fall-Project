@@ -9,7 +9,7 @@ data/UDC-SIT_subset/
 *.tar.gz
 
 # Model Checkpoints
-*.pth
+# *.pth
 *.pt
 
 # IDE / OS specific
