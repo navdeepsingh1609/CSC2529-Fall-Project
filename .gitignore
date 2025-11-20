@@ -9,10 +9,15 @@ data/UDC-SIT_subset/
 *.tar.gz
 
 # Model Checkpoints
-# *.pth
+*.pth
 *.pt
 
 # IDE / OS specific
 .DS_Store
 .vscode/
 .temp/*
+.venv/
+results/
+results_full/
+results_full_srgb/
+results_full_srgb_te/
