@@ -1,329 +1,175 @@
-# eval_srgb_udc.py
-"""
-Evaluate UDC-SIT predictions in sRGB space (PSNR / SSIM / LPIPS).
-
-- Loads 4-ch .npy (H, W, 4) for input, GT, and model predictions.
-- Normalizes to [0,1] (handles both [0,1023] and [0,1]).
-- Uses a consistent 4ch -> sRGB mapping for *all* images:
-    * lightweight ISP (channel mixing + optional WB + gamma)
-- Computes PSNR / SSIM / LPIPS on sRGB images.
-- Writes CSV + summary for:
-    - input_baseline (input vs GT)
-    - teacher_full   (teacher preds vs GT)
-    - student_full   (student preds vs GT)
-- Mirrors results to Google Drive if path is provided.
-"""
-
+# File: eval_srgb_udc.py
 import os
-import sys
 import argparse
 import csv
 from glob import glob
 
 import numpy as np
-from tqdm import tqdm
-
 import torch
-import lpips
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 
-def load_and_normalize_4ch(path):
+def fourch_to_rgb(arr_4ch: np.ndarray) -> np.ndarray:
     """
-    Load a 4-channel .npy file and normalize to [0,1].
+    Convert a 4-channel UDC-SIT array to a simple pseudo-RGB image in [0,1].
 
-    Handles both raw [0,1023] and already-normalized [0,1] inputs.
-    Returns array of shape (H, W, 4), float32 in [0,1].
-    """
-    arr = np.load(path).astype(np.float32)
-
-    if arr.ndim != 3 or arr.shape[2] != 4:
-        raise ValueError(f"Expected (H, W, 4) array, got {arr.shape} for {path}")
-
-    maxv = float(arr.max())
-    if maxv == 0.0:
-        return arr  # all zeros
-    if maxv > 2.0:
-        # Assume 10-bit raw [0,1023]
-        arr = arr / 1023.0
-    else:
-        # Assume already in [0,1], just clip
-        arr = np.clip(arr, 0.0, 1.0)
-    return arr
-
-
-def fourch_to_srgb(arr_4ch, wb_mode="channel_gains", gamma=2.2):
-    """
-    Convert 4-channel Bayer-like array (H, W, 4) in [0,1] to approximate sRGB (H, W, 3) in [0,1].
-
-    This is a lightweight, differentiable-free ISP approximation:
-    - Channel mixing to mimic demosaicing + white balance
-    - Optional simple white balance (per-channel gains)
-    - Global gamma correction
-
-    wb_mode:
-        - "none"           : no extra white balance
-        - "channel_gains"  : fixed gains [1.2, 1.0, 1.5]
-    gamma:
-        - gamma value for output gamma correction (e.g., 2.2). If 1.0, no gamma applied.
+    Assumes arr_4ch is (H, W, 4) with values either in [0,1023] or [0,1].
+    Uses a simple mapping:
+        R = C0
+        G = 0.5*(C1 + C2)
+        B = C3
     """
     if arr_4ch.ndim != 3 or arr_4ch.shape[2] != 4:
-        raise ValueError(f"fourch_to_srgb expects (H, W, 4), got {arr_4ch.shape}")
+        raise ValueError(f"Expected (H,W,4) array, got {arr_4ch.shape}")
 
-    # Split channels
-    c0 = arr_4ch[:, :, 0]
-    c1 = arr_4ch[:, :, 1]
-    c2 = arr_4ch[:, :, 2]
-    c3 = arr_4ch[:, :, 3]
-
-    # Heuristic mixing: treat c1 as R, c2 as G, c3 as B, c0 as extra brightness.
-    R_lin = c1 + 0.1 * c0
-    G_lin = c2 + 0.1 * c0
-    B_lin = c3 + 0.1 * c0
-
-    rgb_lin = np.stack([R_lin, G_lin, B_lin], axis=-1)
-
-    # Simple white balance in linear domain
-    if wb_mode == "channel_gains":
-        gains = np.array([1.2, 1.0, 1.5], dtype=np.float32).reshape(1, 1, 3)
-        rgb_lin = rgb_lin * gains
-    # elif wb_mode == "none": do nothing
-    rgb_lin = np.clip(rgb_lin, 0.0, 1.0)
-
-    # Gamma correction to approximate display sRGB
-    if gamma is not None and gamma != 1.0:
-        rgb_srgb = np.power(rgb_lin, 1.0 / gamma)
+    # Normalize to [0,1] if needed
+    if arr_4ch.max() > 2.0:
+        arr = arr_4ch.astype(np.float32) / 1023.0
     else:
-        rgb_srgb = rgb_lin
+        arr = arr_4ch.astype(np.float32)
 
-    rgb_srgb = np.clip(rgb_srgb, 0.0, 1.0)
-    return rgb_srgb.astype(np.float32)
+    r = arr[:, :, 0]
+    g = 0.5 * (arr[:, :, 1] + arr[:, :, 2])
+    b = arr[:, :, 3]
+
+    rgb = np.stack([r, g, b], axis=-1)
+    rgb = np.clip(rgb, 0.0, 1.0)
+    return rgb
 
 
-def compute_srgb_metrics(pred_srgb, gt_srgb, lpips_model, device):
+def apply_white_balance(rgb: np.ndarray, mode: str = "none") -> np.ndarray:
     """
-    pred_srgb, gt_srgb: (H, W, 3) float32 np arrays in [0,1].
-    Returns: psnr, ssim, lpips_val.
+    Simple white-balance correction applied to an sRGB image in [0,1].
+
+    mode:
+        - "none": no change
+        - "gray": Gray-world assumption (equalize per-channel means)
     """
-    pred = np.clip(pred_srgb, 0.0, 1.0)
-    gt   = np.clip(gt_srgb,   0.0, 1.0)
+    if mode == "none":
+        return rgb
 
-    psnr = peak_signal_noise_ratio(gt, pred, data_range=1.0)
-    ssim = structural_similarity(gt, pred, data_range=1.0, channel_axis=-1)
+    if mode == "gray":
+        h, w, c = rgb.shape
+        flat = rgb.reshape(-1, c)
+        means = flat.mean(axis=0) + 1e-6
+        gray = means.mean()
+        scale = gray / means
+        balanced = rgb * scale[None, None, :]
+        return np.clip(balanced, 0.0, 1.0)
 
-    # LPIPS expects tensors in [-1,1]
-    pred_t = torch.from_numpy(pred).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
-    gt_t   = torch.from_numpy(gt).permute(2, 0, 1).unsqueeze(0).to(device) * 2.0 - 1.0
-
-    with torch.no_grad():
-        lp = lpips_model(pred_t, gt_t).item()
-
-    return psnr, ssim, lp
+    # Unknown mode, just return original
+    return rgb
 
 
-def evaluate_model(
-    name,
-    pred_dir,
-    data_root,
-    split,
-    lpips_model,
-    wb_mode,
-    gamma,
-    max_images,
-    results_root,
-    drive_results_root,
-    device,
-):
+def apply_gamma(rgb: np.ndarray, gamma: float = 1.0) -> np.ndarray:
     """
-    Evaluate one model (or baseline) in sRGB space.
+    Apply gamma correction to an sRGB image in [0,1].
 
-    name:         label used for results folder (e.g., "teacher_full", "student_full", "input_baseline")
-    pred_dir:     directory containing 4-ch .npy predictions (H, W, 4), or None for baseline input
-    data_root:    root of UDC-SIT (contains {split}/input and {split}/GT)
-    split:        "validation" or "testing"
+    If gamma == 1.0, returns input unchanged.
     """
-    gt_dir  = os.path.join(data_root, split, "GT")
-    inp_dir = os.path.join(data_root, split, "input")
-
-    if not os.path.isdir(gt_dir):
-        print(f"[eval_srgb_udc] ERROR: GT directory not found: {gt_dir}")
-        return
-
-    gt_files = sorted(glob(os.path.join(gt_dir, "*.npy")))
-    if max_images is not None:
-        gt_files = gt_files[:max_images]
-
-    if len(gt_files) == 0:
-        print(f"[eval_srgb_udc] No GT .npy files found in {gt_dir}")
-        return
-
-    results_dir = os.path.join(results_root, f"{name}_{split}")
-    os.makedirs(results_dir, exist_ok=True)
-
-    if drive_results_root is not None and drive_results_root != "":
-        drive_results_dir = os.path.join(drive_results_root, f"{name}_{split}")
-        os.makedirs(drive_results_dir, exist_ok=True)
-    else:
-        drive_results_dir = None
-
-    csv_path     = os.path.join(results_dir, "metrics_srgb.csv")
-    summary_path = os.path.join(results_dir, "metrics_summary.txt")
-
-    rows = []
-    psnr_list = []
-    ssim_list = []
-    lpips_list = []
-
-    print(f"\n--- [eval_srgb_udc] Evaluating '{name}' on split '{split}' ---")
-    print(f"GT dir:    {gt_dir}")
-    if pred_dir is not None:
-        print(f"Pred dir:  {pred_dir}")
-    else:
-        print("Pred dir:  None (using input as baseline)")
-
-    for gt_path in tqdm(gt_files, desc=f"[{name}] images", ncols=80):
-        base = os.path.basename(gt_path)
-
-        # Corresponding input / pred paths
-        inp_path = os.path.join(inp_dir, base)
-        if pred_dir is not None:
-            pred_path = os.path.join(pred_dir, base)
-        else:
-            pred_path = inp_path  # baseline: input vs GT
-
-        if not os.path.exists(inp_path):
-            print(f"  [WARN] Missing input for {base}, skipping.")
-            continue
-        if not os.path.exists(pred_path):
-            print(f"  [WARN] Missing prediction for {base} in {pred_dir}, skipping.")
-            continue
-
-        # Load 4-ch
-        gt_4ch   = load_and_normalize_4ch(gt_path)
-        pred_4ch = load_and_normalize_4ch(pred_path)
-
-        # Convert to sRGB
-        gt_srgb   = fourch_to_srgb(gt_4ch,   wb_mode=wb_mode, gamma=gamma)
-        pred_srgb = fourch_to_srgb(pred_4ch, wb_mode=wb_mode, gamma=gamma)
-
-        # Metrics
-        psnr, ssim, lp = compute_srgb_metrics(pred_srgb, gt_srgb, lpips_model, device)
-        rows.append(
-            {
-                "filename": base,
-                "psnr_srgb": psnr,
-                "ssim_srgb": ssim,
-                "lpips_srgb": lp,
-            }
-        )
-        psnr_list.append(psnr)
-        ssim_list.append(ssim)
-        lpips_list.append(lp)
-
-    # Save CSV
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["filename", "psnr_srgb", "ssim_srgb", "lpips_srgb"]
-        )
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-
-    # Summary
-    mean_psnr  = float(np.mean(psnr_list)) if psnr_list else float("nan")
-    mean_ssim  = float(np.mean(ssim_list)) if ssim_list else float("nan")
-    mean_lpips = float(np.mean(lpips_list)) if lpips_list else float("nan")
-
-    with open(summary_path, "w") as f:
-        f.write(f"Model: {name}\n")
-        f.write(f"Split: {split}\n")
-        f.write(f"Num images: {len(psnr_list)}\n\n")
-        f.write(f"Mean PSNR (sRGB): {mean_psnr:.4f} dB\n")
-        f.write(f"Mean SSIM (sRGB): {mean_ssim:.4f}\n")
-        f.write(f"Mean LPIPS (sRGB): {mean_lpips:.4f}\n")
-        f.write(f"WB mode: {wb_mode}\n")
-        f.write(f"Gamma:   {gamma}\n")
-
-    print(f"\n--- [eval_srgb_udc] {name} results on '{split}':")
-    print(f"Mean PSNR (sRGB): {mean_psnr:.4f} dB")
-    print(f"Mean SSIM (sRGB): {mean_ssim:.4f}")
-    print(f"Mean LPIPS (sRGB): {mean_lpips:.4f}")
-    print(f"Saved CSV to     : {csv_path}")
-    print(f"Saved summary to : {summary_path}")
-
-    # Copy to Drive if requested
-    if drive_results_dir is not None:
-        import shutil
-
-        shutil.copy(csv_path, os.path.join(drive_results_dir, "metrics_srgb.csv"))
-        shutil.copy(summary_path, os.path.join(drive_results_dir, "metrics_summary.txt"))
-        print(f"Copied metrics to Drive: {drive_results_dir}")
+    if gamma is None or abs(gamma - 1.0) < 1e-6:
+        return rgb
+    rgb = np.clip(rgb, 0.0, 1.0)
+    return np.power(rgb, 1.0 / gamma)
 
 
-def main():
+def compute_psnr_ssim(gt_rgb: np.ndarray, pred_rgb: np.ndarray):
+    """
+    Compute PSNR and SSIM for two sRGB images in [0,1].
+
+    Both arrays are (H,W,3).
+    """
+    if gt_rgb.shape != pred_rgb.shape:
+        raise ValueError(f"Shape mismatch: {gt_rgb.shape} vs {pred_rgb.shape}")
+
+    psnr = peak_signal_noise_ratio(gt_rgb, pred_rgb, data_range=1.0)
+    ssim = structural_similarity(gt_rgb, pred_rgb, data_range=1.0, channel_axis=-1)
+    return psnr, ssim
+
+
+def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate UDC-SIT predictions in sRGB space (PSNR/SSIM/LPIPS)."
+        description="Evaluate teacher/student models on UDC-SIT in sRGB space (pseudo-ISP)."
     )
     parser.add_argument(
         "--data-root",
         type=str,
         default="/content/dataset/UDC-SIT/UDC-SIT",
-        help="Root of UDC-SIT full dataset (contains e.g. validation/GT, validation/input).",
+        help="Root of UDC-SIT dataset containing train/validation/testing folders.",
     )
     parser.add_argument(
         "--split",
         type=str,
         default="validation",
-        choices=["validation", "testing"],
-        help="Which split to evaluate.",
+        choices=["train", "validation", "testing"],
+        help="Dataset split to evaluate.",
     )
     parser.add_argument(
         "--teacher-pred-dir",
         type=str,
-        default="results_full/teacher_full_validation/npy",
-        help="Directory with teacher 4-ch .npy predictions.",
+        default="results_quick/teacher_full_validation/npy",
+        help="Directory containing teacher 4-ch .npy predictions.",
     )
     parser.add_argument(
         "--student-pred-dir",
         type=str,
-        default="results_full/student_full_validation/npy",
-        help="Directory with student 4-ch .npy predictions.",
+        default="results_quick/student_full_validation/npy",
+        help="Directory containing student 4-ch .npy predictions.",
     )
     parser.add_argument(
         "--max-images",
         type=int,
         default=None,
-        help="Max number of images to evaluate (for quick testing).",
+        help="If set, limit the number of images evaluated.",
     )
     parser.add_argument(
         "--results-root",
         type=str,
         default="results_srgb_metrics",
-        help="Where to store sRGB metrics CSVs + summaries.",
+        help="Local directory to store sRGB metric CSV + summary.",
     )
     parser.add_argument(
         "--drive-results-root",
         type=str,
         default="/content/drive/MyDrive/Computational Imaging Project/results_srgb_metrics",
-        help="Google Drive folder for sRGB metrics (will mirror results_root).",
+        help="Google Drive directory to mirror sRGB metrics. Leave empty to disable.",
     )
     parser.add_argument(
         "--wb-mode",
         type=str,
-        default="channel_gains",
-        choices=["none", "channel_gains"],
-        help="White-balance mode applied in fourch_to_srgb.",
+        default="none",
+        choices=["none", "gray"],
+        help="White balance mode applied to all sRGB images before metrics.",
     )
     parser.add_argument(
         "--gamma",
         type=float,
-        default=2.2,
-        help="Gamma for fourch_to_srgb (1.0 = no gamma correction).",
+        default=1.0,
+        help="Gamma correction applied to all sRGB images before metrics.",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Included only to mirror training/testing scripts; not used here.",
+    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def main():
+    args = parse_args()
+
+    input_dir = os.path.join(args.data_root, args.split, "input")
+    gt_dir = os.path.join(args.data_root, args.split, "GT")
+
+    if not os.path.isdir(input_dir):
+        raise FileNotFoundError(f"[eval_srgb_udc] Missing input dir: {input_dir}")
+    if not os.path.isdir(gt_dir):
+        raise FileNotFoundError(f"[eval_srgb_udc] Missing GT dir: {gt_dir}")
+
+    os.makedirs(args.results_root, exist_ok=True)
+    if args.drive_results_root is not None and len(args.drive_results_root) > 0:
+        os.makedirs(args.drive_results_root, exist_ok=True)
 
     print("=== [eval_srgb_udc] Config ===")
     print(f"Data root:      {args.data_root}")
@@ -335,62 +181,156 @@ def main():
     print(f"Drive results:  {args.drive_results_root}")
     print(f"WB mode:        {args.wb_mode}")
     print(f"Gamma:          {args.gamma}")
-    print(f"Device:         {device}")
     print("=================================")
 
-    os.makedirs(args.results_root, exist_ok=True)
-    if args.drive_results_root is not None and args.drive_results_root != "":
+    gt_files = sorted(glob(os.path.join(gt_dir, "*.npy")))
+    if args.max_images is not None:
+        gt_files = gt_files[: args.max_images]
+
+    teacher_dir = args.teacher_pred_dir
+    student_dir = args.student_pred_dir
+
+    metrics_rows = []
+
+    for gt_path in gt_files:
+        fname = os.path.basename(gt_path)
+        inp_path = os.path.join(input_dir, fname)
+
+        if not os.path.exists(inp_path):
+            print(f"[eval_srgb_udc] WARNING: Missing input for {fname}, skipping.")
+            continue
+
+        # Teacher and student predictions may or may not exist
+        teacher_path = (
+            os.path.join(teacher_dir, fname) if teacher_dir and os.path.isdir(teacher_dir) else None
+        )
+        if teacher_path and not os.path.exists(teacher_path):
+            teacher_path = None
+
+        student_path = (
+            os.path.join(student_dir, fname) if student_dir and os.path.isdir(student_dir) else None
+        )
+        if student_path and not os.path.exists(student_path):
+            student_path = None
+
+        # Load 4-ch arrays
+        gt_arr = np.load(gt_path)  # (H,W,4) in [0,1023]
+        inp_arr = np.load(inp_path)
+
+        # Convert to sRGB
+        inp_rgb = fourch_to_rgb(inp_arr)
+        gt_rgb = fourch_to_rgb(gt_arr)
+
+        teacher_rgb = None
+        if teacher_path is not None:
+            teacher_arr = np.load(teacher_path)
+            teacher_rgb = fourch_to_rgb(teacher_arr)
+
+        student_rgb = None
+        if student_path is not None:
+            student_arr = np.load(student_path)
+            student_rgb = fourch_to_rgb(student_arr)
+
+        # Apply WB + gamma
+        inp_rgb = apply_gamma(apply_white_balance(inp_rgb, args.wb_mode), args.gamma)
+        gt_rgb = apply_gamma(apply_white_balance(gt_rgb, args.wb_mode), args.gamma)
+
+        if teacher_rgb is not None:
+            teacher_rgb = apply_gamma(
+                apply_white_balance(teacher_rgb, args.wb_mode), args.gamma
+            )
+        if student_rgb is not None:
+            student_rgb = apply_gamma(
+                apply_white_balance(student_rgb, args.wb_mode), args.gamma
+            )
+
+        # Metrics: input vs GT, teacher vs GT, student vs GT
+        psnr_in, ssim_in = compute_psnr_ssim(gt_rgb, inp_rgb)
+        psnr_teacher, ssim_teacher = (np.nan, np.nan)
+        psnr_student, ssim_student = (np.nan, np.nan)
+
+        if teacher_rgb is not None:
+            psnr_teacher, ssim_teacher = compute_psnr_ssim(gt_rgb, teacher_rgb)
+        if student_rgb is not None:
+            psnr_student, ssim_student = compute_psnr_ssim(gt_rgb, student_rgb)
+
+        metrics_rows.append(
+            {
+                "filename": fname,
+                "psnr_input": psnr_in,
+                "ssim_input": ssim_in,
+                "psnr_teacher": psnr_teacher,
+                "ssim_teacher": ssim_teacher,
+                "psnr_student": psnr_student,
+                "ssim_student": ssim_student,
+            }
+        )
+
+    # Save CSV + summary
+    csv_path = os.path.join(args.results_root, f"{args.split}_metrics_srgb.csv")
+    summary_path = os.path.join(args.results_root, f"{args.split}_metrics_srgb_summary.txt")
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "filename",
+                "psnr_input",
+                "ssim_input",
+                "psnr_teacher",
+                "ssim_teacher",
+                "psnr_student",
+                "ssim_student",
+            ],
+        )
+        writer.writeheader()
+        for row in metrics_rows:
+            writer.writerow(row)
+
+    # Summary: mean metrics
+    def safe_mean(vals):
+        vals = [v for v in vals if not np.isnan(v)]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    mean_psnr_in = safe_mean([r["psnr_input"] for r in metrics_rows])
+    mean_ssim_in = safe_mean([r["ssim_input"] for r in metrics_rows])
+
+    mean_psnr_teacher = safe_mean([r["psnr_teacher"] for r in metrics_rows])
+    mean_ssim_teacher = safe_mean([r["ssim_teacher"] for r in metrics_rows])
+
+    mean_psnr_student = safe_mean([r["psnr_student"] for r in metrics_rows])
+    mean_ssim_student = safe_mean([r["ssim_student"] for r in metrics_rows])
+
+    with open(summary_path, "w") as f:
+        f.write(f"Split: {args.split}\n")
+        f.write(f"Num images: {len(metrics_rows)}\n\n")
+        f.write("Input vs GT:\n")
+        f.write(f"  Mean PSNR: {mean_psnr_in:.4f} dB\n")
+        f.write(f"  Mean SSIM: {mean_ssim_in:.4f}\n\n")
+        f.write("Teacher vs GT:\n")
+        f.write(f"  Mean PSNR: {mean_psnr_teacher:.4f} dB\n")
+        f.write(f"  Mean SSIM: {mean_ssim_teacher:.4f}\n\n")
+        f.write("Student vs GT:\n")
+        f.write(f"  Mean PSNR: {mean_psnr_student:.4f} dB\n")
+        f.write(f"  Mean SSIM: {mean_ssim_student:.4f}\n")
+
+    print(f"[eval_srgb_udc] Saved CSV to {csv_path}")
+    print(f"[eval_srgb_udc] Saved summary to {summary_path}")
+    print("Summary (mean metrics):")
+    print(f"  Input   -> PSNR: {mean_psnr_in:.4f} dB, SSIM: {mean_ssim_in:.4f}")
+    print(f"  Teacher -> PSNR: {mean_psnr_teacher:.4f} dB, SSIM: {mean_ssim_teacher:.4f}")
+    print(f"  Student -> PSNR: {mean_psnr_student:.4f} dB, SSIM: {mean_ssim_student:.4f}")
+
+    # Copy to Drive
+    if args.drive_results_root is not None and len(args.drive_results_root) > 0:
+        import shutil
+
         os.makedirs(args.drive_results_root, exist_ok=True)
-
-    # LPIPS model
-    lpips_model = lpips.LPIPS(net="vgg").to(device)
-
-    # Baseline: input vs GT
-    evaluate_model(
-        name="input_baseline",
-        pred_dir=None,
-        data_root=args.data_root,
-        split=args.split,
-        lpips_model=lpips_model,
-        wb_mode=args.wb_mode,
-        gamma=args.gamma,
-        max_images=args.max_images,
-        results_root=args.results_root,
-        drive_results_root=args.drive_results_root,
-        device=device,
-    )
-
-    # Teacher
-    if args.teacher_pred_dir is not None and args.teacher_pred_dir != "":
-        evaluate_model(
-            name="teacher_full",
-            pred_dir=args.teacher_pred_dir,
-            data_root=args.data_root,
-            split=args.split,
-            lpips_model=lpips_model,
-            wb_mode=args.wb_mode,
-            gamma=args.gamma,
-            max_images=args.max_images,
-            results_root=args.results_root,
-            drive_results_root=args.drive_results_root,
-            device=device,
-        )
-
-    # Student
-    if args.student_pred_dir is not None and args.student_pred_dir != "":
-        evaluate_model(
-            name="student_full",
-            pred_dir=args.student_pred_dir,
-            data_root=args.data_root,
-            split=args.split,
-            lpips_model=lpips_model,
-            wb_mode=args.wb_mode,
-            gamma=args.gamma,
-            max_images=args.max_images,
-            results_root=args.results_root,
-            drive_results_root=args.drive_results_root,
-            device=device,
-        )
+        drive_csv = os.path.join(args.drive_results_root, os.path.basename(csv_path))
+        drive_summary = os.path.join(args.drive_results_root, os.path.basename(summary_path))
+        shutil.copy(csv_path, drive_csv)
+        shutil.copy(summary_path, drive_summary)
+        print(f"[eval_srgb_udc] Copied results to Drive: {args.drive_results_root}")
 
 
 if __name__ == "__main__":
