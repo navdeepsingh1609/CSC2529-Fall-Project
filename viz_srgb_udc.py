@@ -1,244 +1,306 @@
-# File: viz_srgb_udc.py
+# viz_srgb_udc.py
 """
-Unified visualization panels for UDC-SIT in sRGB.
+Visualize UDC-SIT predictions in sRGB space.
 
-For each image (up to --max-images):
-- Load input 4-ch npy: <data_root>/<split>/input/<name>.npy
-- Load GT 4-ch npy:    <data_root>/<split>/GT/<name>.npy
-- Load teacher pred:   <teacher_pred_dir>/<name>.npy (optional)
-- Load student pred:   <student_pred_dir>/<name>.npy (optional)
-
-Convert 4-ch -> sRGB using the same mapping as eval_srgb_udc.py and generate
-a 2x2 panel:
-
-    [ Input ]   [ Teacher ]
-    [ Student ] [ Ground Truth ]
-
-If teacher/student predictions are missing, those slots show "N/A".
-
-Outputs:
-- Per-image panel PNGs under `viz_root/<split>/<name>_panel.png`.
-- Optionally mirrored under `drive_viz_root/<split>/`.
+- Loads 4-ch .npy (H, W, 4) for input, GT, and predictions.
+- Normalizes to [0,1] (handles [0,1023] or [0,1]).
+- Uses same 4ch -> sRGB mapping as eval_srgb_udc.py.
+- For each image, creates a 1x4 panel:
+    Input | Teacher | Student | GT
+- Saves panels locally and mirrors them to Google Drive.
 """
 
 import os
-import sys
 import argparse
 from glob import glob
 
 import numpy as np
-import matplotlib.pyplot as plt
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 
-def parse_args():
+def load_and_normalize_4ch(path):
+    """
+    Load a 4-channel .npy file and normalize to [0,1].
+
+    Handles both raw [0,1023] and already-normalized [0,1] inputs.
+    Returns array of shape (H, W, 4), float32 in [0,1].
+    """
+    arr = np.load(path).astype(np.float32)
+
+    if arr.ndim != 3 or arr.shape[2] != 4:
+        raise ValueError(f"Expected (H, W, 4) array, got {arr.shape} for {path}")
+
+    maxv = float(arr.max())
+    if maxv == 0.0:
+        return arr  # all zeros
+    if maxv > 2.0:
+        arr = arr / 1023.0
+    else:
+        arr = np.clip(arr, 0.0, 1.0)
+    return arr
+
+
+def fourch_to_srgb(arr_4ch, wb_mode="channel_gains", gamma=2.2):
+    """
+    Convert 4-channel Bayer-like array (H, W, 4) in [0,1] to approximate sRGB (H, W, 3) in [0,1].
+
+    This is a lightweight visualization-only ISP approximation.
+    """
+    if arr_4ch.ndim != 3 or arr_4ch.shape[2] != 4:
+        raise ValueError(f"fourch_to_srgb expects (H, W, 4), got {arr_4ch.shape}")
+
+    c0 = arr_4ch[:, :, 0]
+    c1 = arr_4ch[:, :, 1]
+    c2 = arr_4ch[:, :, 2]
+    c3 = arr_4ch[:, :, 3]
+
+    R_lin = c1 + 0.1 * c0
+    G_lin = c2 + 0.1 * c0
+    B_lin = c3 + 0.1 * c0
+
+    rgb_lin = np.stack([R_lin, G_lin, B_lin], axis=-1)
+
+    if wb_mode == "channel_gains":
+        gains = np.array([1.2, 1.0, 1.5], dtype=np.float32).reshape(1, 1, 3)
+        rgb_lin = rgb_lin * gains
+    rgb_lin = np.clip(rgb_lin, 0.0, 1.0)
+
+    if gamma is not None and gamma != 1.0:
+        rgb_srgb = np.power(rgb_lin, 1.0 / gamma)
+    else:
+        rgb_srgb = rgb_lin
+
+    rgb_srgb = np.clip(rgb_srgb, 0.0, 1.0)
+    return rgb_srgb.astype(np.float32)
+
+
+def save_panel(
+    out_path,
+    inp_srgb,
+    teacher_srgb,
+    student_srgb,
+    gt_srgb,
+    title="",
+):
+    """
+    Save a 1x4 panel figure: Input | Teacher | Student | GT
+    directly to out_path using Matplotlib (no numpy conversion of canvas).
+    """
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    axes = axes.ravel()
+
+    images = [inp_srgb, teacher_srgb, student_srgb, gt_srgb]
+    labels = ["Input", "Teacher", "Student", "GT"]
+
+    for ax, img, label in zip(axes, images, labels):
+        ax.axis("off")
+        if img is not None:
+            ax.imshow(np.clip(img, 0.0, 1.0))
+            ax.set_title(label, fontsize=10)
+        else:
+            ax.set_title(f"{label}\n(N/A)", fontsize=10)
+
+    if title:
+        fig.suptitle(title, fontsize=12)
+
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.85 if title else 0.9)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def process_split(
+    data_root,
+    split,
+    teacher_pred_dir,
+    student_pred_dir,
+    max_images,
+    viz_root,
+    drive_viz_root,
+    wb_mode,
+    gamma,
+):
+    gt_dir  = os.path.join(data_root, split, "GT")
+    inp_dir = os.path.join(data_root, split, "input")
+
+    if not os.path.isdir(gt_dir):
+        print(f"[viz_srgb_udc] ERROR: GT dir not found: {gt_dir}")
+        return
+    if not os.path.isdir(inp_dir):
+        print(f"[viz_srgb_udc] ERROR: input dir not found: {inp_dir}")
+        return
+
+    gt_files = sorted(glob(os.path.join(gt_dir, "*.npy")))
+    if max_images is not None:
+        gt_files = gt_files[:max_images]
+
+    if len(gt_files) == 0:
+        print(f"[viz_srgb_udc] No GT .npy files in {gt_dir}")
+        return
+
+    split_viz_dir = os.path.join(viz_root, split)
+    os.makedirs(split_viz_dir, exist_ok=True)
+
+    if drive_viz_root is not None and drive_viz_root != "":
+        drive_split_dir = os.path.join(drive_viz_root, split)
+        os.makedirs(drive_split_dir, exist_ok=True)
+    else:
+        drive_split_dir = None
+
+    print(f"\n--- [viz_srgb_udc] Visualizing split '{split}' ---")
+    print(f"GT dir:       {gt_dir}")
+    print(f"Input dir:    {inp_dir}")
+    print(f"Teacher preds:{teacher_pred_dir}")
+    print(f"Student preds:{student_pred_dir}")
+    print(f"Output dir:   {split_viz_dir}")
+
+    for gt_path in tqdm(gt_files, desc=f"[viz {split}] images", ncols=80):
+        base = os.path.basename(gt_path)
+        name = os.path.splitext(base)[0]
+
+        inp_path = os.path.join(inp_dir, base)
+        if not os.path.exists(inp_path):
+            print(f"  [WARN] Missing input for {base}, skipping.")
+            continue
+
+        teacher_path = (
+            os.path.join(teacher_pred_dir, base)
+            if teacher_pred_dir is not None and teacher_pred_dir != ""
+            else None
+        )
+        student_path = (
+            os.path.join(student_pred_dir, base)
+            if student_pred_dir is not None and student_pred_dir != ""
+            else None
+        )
+
+        # Load and convert to sRGB
+        inp_4ch = load_and_normalize_4ch(inp_path)
+        gt_4ch  = load_and_normalize_4ch(gt_path)
+
+        inp_srgb = fourch_to_srgb(inp_4ch, wb_mode=wb_mode, gamma=gamma)
+        gt_srgb  = fourch_to_srgb(gt_4ch,  wb_mode=wb_mode, gamma=gamma)
+
+        teacher_srgb = None
+        student_srgb = None
+
+        if teacher_path is not None and os.path.exists(teacher_path):
+            teacher_4ch   = load_and_normalize_4ch(teacher_path)
+            teacher_srgb  = fourch_to_srgb(teacher_4ch, wb_mode=wb_mode, gamma=gamma)
+
+        if student_path is not None and os.path.exists(student_path):
+            student_4ch   = load_and_normalize_4ch(student_path)
+            student_srgb  = fourch_to_srgb(student_4ch, wb_mode=wb_mode, gamma=gamma)
+
+        panel_title = f"{split} - {name}"
+        panel_path  = os.path.join(split_viz_dir, f"{name}_panel.png")
+
+        save_panel(
+            out_path=panel_path,
+            inp_srgb=inp_srgb,
+            teacher_srgb=teacher_srgb,
+            student_srgb=student_srgb,
+            gt_srgb=gt_srgb,
+            title=panel_title,
+        )
+
+        if drive_split_dir is not None:
+            import shutil
+
+            shutil.copy(panel_path, os.path.join(drive_split_dir, os.path.basename(panel_path)))
+
+
+def main():
     parser = argparse.ArgumentParser(
-        description="Unified sRGB visualization for UDC-SIT teacher/student predictions."
+        description="Visualize UDC-SIT predictions in sRGB (Input | Teacher | Student | GT panels)."
     )
-
     parser.add_argument(
         "--data-root",
         type=str,
-        default="/content/dataset/UDC-SIT",
-        help="Root of UDC-SIT dataset; expects <data-root>/<split>/(input|GT)/*.npy",
+        default="/content/dataset/UDC-SIT/UDC-SIT",
+        help="Root of UDC-SIT dataset (contains e.g. validation/GT, validation/input).",
     )
     parser.add_argument(
         "--split",
         type=str,
         default="validation",
-        help="Split under data-root (e.g., training, validation, testing, train, val, test).",
+        choices=["validation", "testing"],
+        help="Which split to visualize.",
     )
-
     parser.add_argument(
         "--teacher-pred-dir",
         type=str,
         default="results_full/teacher_full_validation/npy",
-        help="Directory containing teacher 4-ch predictions (.npy). Leave empty if none.",
+        help="Directory with teacher 4-ch .npy predictions.",
     )
     parser.add_argument(
         "--student-pred-dir",
         type=str,
         default="results_full/student_full_validation/npy",
-        help="Directory containing student 4-ch predictions (.npy). Leave empty if none.",
+        help="Directory with student 4-ch .npy predictions.",
     )
-
     parser.add_argument(
         "--max-images",
         type=int,
-        default=20,
-        help="Max number of images to visualize (sorted by filename).",
+        default=50,
+        help="Max number of images to visualize.",
     )
-
     parser.add_argument(
         "--viz-root",
         type=str,
-        default="viz_srgb_panels",
-        help="Local root folder for visualization outputs.",
+        default="results_srgb_viz",
+        help="Where to store sRGB comparison panels.",
     )
     parser.add_argument(
         "--drive-viz-root",
         type=str,
-        default="/content/drive/MyDrive/Computational Imaging Project/viz_srgb_panels",
-        help="Drive root folder to mirror visualization outputs.",
+        default="/content/drive/MyDrive/Computational Imaging Project/results_srgb_viz",
+        help="Google Drive folder to mirror viz panels.",
+    )
+    parser.add_argument(
+        "--wb-mode",
+        type=str,
+        default="channel_gains",
+        choices=["none", "channel_gains"],
+        help="White-balance mode applied in fourch_to_srgb.",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=2.2,
+        help="Gamma for fourch_to_srgb (1.0 = no gamma correction).",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
 
-
-def load_4ch_npy(path):
-    """
-    Load (H, W, 4) [0..1023] -> (H, W, 4) [0..1].
-    """
-    arr = np.load(path)
-    if arr.ndim != 3 or arr.shape[2] != 4:
-        raise ValueError(f"Expected (H, W, 4) at {path}, got {arr.shape}")
-    return arr.astype(np.float32) / 1023.0
-
-
-def fourch_to_srgb(arr_4ch):
-    """
-    Same mapping as in eval_srgb_udc.py.
-    ch0: GR, ch1: R, ch2: B, ch3: GB
-    """
-    GR = arr_4ch[:, :, 0]
-    R  = arr_4ch[:, :, 1]
-    B  = arr_4ch[:, :, 2]
-    GB = arr_4ch[:, :, 3]
-
-    G = 0.5 * (GR + GB)
-    rgb = np.stack([R, G, B], axis=-1)
-    rgb = np.clip(rgb, 0.0, 1.0)
-    return rgb
-
-
-def make_panel(input_rgb, teacher_rgb, student_rgb, gt_rgb, title):
-    """
-    Build a 2x2 matplotlib figure and return the figure.
-    teacher_rgb or student_rgb can be None (slot becomes blank).
-    """
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-    fig.suptitle(title, fontsize=14)
-
-    def show(ax, img, label):
-        ax.set_title(label)
-        ax.axis("off")
-        if img is None:
-            ax.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=12)
-        else:
-            ax.imshow(np.clip(img, 0.0, 1.0))
-
-    show(axes[0, 0], input_rgb,   "Input (UDC)")
-    show(axes[0, 1], teacher_rgb, "Teacher pred" if teacher_rgb is not None else "Teacher pred (N/A)")
-    show(axes[1, 0], student_rgb, "Student pred" if student_rgb is not None else "Student pred (N/A)")
-    show(axes[1, 1], gt_rgb,      "Ground Truth")
-
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-    return fig
-
-
-def main():
-    args = parse_args()
-
-    print("\n--- [viz_srgb_udc] Configuration ---")
-    print(f"Data root:        {args.data_root}")
-    print(f"Split:            {args.split}")
-    print(f"Teacher pred dir: {args.teacher_pred_dir}")
-    print(f"Student pred dir: {args.student_pred_dir}")
-    print(f"Max images:       {args.max_images}")
-    print(f"Viz root:         {args.viz_root}")
-    print(f"Drive viz root:   {args.drive_viz_root}")
-    print("-----------------------------------\n")
-
-    input_dir = os.path.join(args.data_root, args.split, "input")
-    gt_dir    = os.path.join(args.data_root, args.split, "GT")
-
-    if not os.path.isdir(input_dir):
-        raise FileNotFoundError(f"Input dir not found: {input_dir}")
-    if not os.path.isdir(gt_dir):
-        raise FileNotFoundError(f"GT dir not found: {gt_dir}")
-
-    input_files = sorted(glob(os.path.join(input_dir, "*.npy")))
-    if args.max_images is not None:
-        input_files = input_files[:args.max_images]
+    print("=== [viz_srgb_udc] Config ===")
+    print(f"Data root:      {args.data_root}")
+    print(f"Split:          {args.split}")
+    print(f"Teacher preds:  {args.teacher_pred_dir}")
+    print(f"Student preds:  {args.student_pred_dir}")
+    print(f"Max images:     {args.max_images}")
+    print(f"Viz root:       {args.viz_root}")
+    print(f"Drive viz root: {args.drive_viz_root}")
+    print(f"WB mode:        {args.wb_mode}")
+    print(f"Gamma:          {args.gamma}")
+    print("=================================")
 
     os.makedirs(args.viz_root, exist_ok=True)
-    os.makedirs(args.drive_viz_root, exist_ok=True)
+    if args.drive_viz_root is not None and args.drive_viz_root != "":
+        os.makedirs(args.drive_viz_root, exist_ok=True)
 
-    split_viz_dir = os.path.join(args.viz_root, args.split)
-    os.makedirs(split_viz_dir, exist_ok=True)
-
-    teacher_dir = args.teacher_pred_dir if args.teacher_pred_dir and os.path.isdir(args.teacher_pred_dir) else None
-    student_dir = args.student_pred_dir if args.student_pred_dir and os.path.isdir(args.student_pred_dir) else None
-
-    print(f"--- [viz_srgb_udc] Num images to visualize: {len(input_files)}")
-
-    pbar = tqdm(input_files, desc=f"[viz {args.split}]")
-    for inp_path in pbar:
-        fname = os.path.basename(inp_path)
-        name_noext = os.path.splitext(fname)[0]
-
-        gt_path = os.path.join(gt_dir, fname)
-        if not os.path.exists(gt_path):
-            print(f"WARNING: GT not found for {fname}, skipping.")
-            continue
-
-        # Base input & GT
-        arr_inp = load_4ch_npy(inp_path)
-        arr_gt  = load_4ch_npy(gt_path)
-        if arr_inp.shape != arr_gt.shape:
-            print(f"WARNING: shape mismatch input/GT for {fname}, skipping.")
-            continue
-
-        inp_rgb = fourch_to_srgb(arr_inp)
-        gt_rgb  = fourch_to_srgb(arr_gt)
-
-        # Teacher & Student predictions (optional)
-        teacher_rgb = None
-        student_rgb = None
-
-        if teacher_dir is not None:
-            t_path = os.path.join(teacher_dir, fname)
-            if os.path.exists(t_path):
-                arr_t = load_4ch_npy(t_path)
-                if arr_t.shape == arr_gt.shape:
-                    teacher_rgb = fourch_to_srgb(arr_t)
-                else:
-                    print(f"WARNING: teacher pred shape mismatch for {fname}, skipping teacher.")
-            else:
-                # silent if missing
-                pass
-
-        if student_dir is not None:
-            s_path = os.path.join(student_dir, fname)
-            if os.path.exists(s_path):
-                arr_s = load_4ch_npy(s_path)
-                if arr_s.shape == arr_gt.shape:
-                    student_rgb = fourch_to_srgb(arr_s)
-                else:
-                    print(f"WARNING: student pred shape mismatch for {fname}, skipping student.")
-            else:
-                # silent if missing
-                pass
-
-        panel_title = f"{args.split} - {name_noext}"
-        fig = make_panel(inp_rgb, teacher_rgb, student_rgb, gt_rgb, title=panel_title)
-
-        panel_path = os.path.join(split_viz_dir, f"{name_noext}_panel.png")
-        fig.savefig(panel_path, dpi=150)
-        plt.close(fig)
-
-    # Copy whole split folder to Drive
-    try:
-        import shutil
-        drive_split_dir = os.path.join(args.drive_viz_root, args.split)
-        os.makedirs(drive_split_dir, exist_ok=True)
-        # Copy panel PNGs
-        for panel_file in glob(os.path.join(split_viz_dir, "*.png")):
-            base = os.path.basename(panel_file)
-            shutil.copy(panel_file, os.path.join(drive_split_dir, base))
-        print(f"--- [viz_srgb_udc] Copied panels to Drive: {drive_split_dir}")
-    except Exception as e:
-        print(f"Could not copy visualization panels to Drive: {e}")
+    process_split(
+        data_root=args.data_root,
+        split=args.split,
+        teacher_pred_dir=args.teacher_pred_dir,
+        student_pred_dir=args.student_pred_dir,
+        max_images=args.max_images,
+        viz_root=args.viz_root,
+        drive_viz_root=args.drive_viz_root,
+        wb_mode=args.wb_mode,
+        gamma=args.gamma,
+    )
 
 
 if __name__ == "__main__":
