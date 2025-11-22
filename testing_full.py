@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import skimage.metrics
 import lpips
+from tqdm import tqdm
 
 # Try to import Colab download utilities (will fail gracefully outside Colab)
 try:
@@ -44,6 +45,10 @@ os.makedirs(PATCH_SAVE_DIR, exist_ok=True)
 # Where to save CSV metrics
 METRICS_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT/results_full/metrics"
 os.makedirs(METRICS_DIR, exist_ok=True)
+
+# Where to save plots
+PLOTS_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT/results_full/plots"
+os.makedirs(PLOTS_DIR, exist_ok=True)
 
 # ===================================================
 
@@ -209,6 +214,7 @@ def evaluate_split(
     num_plot_examples,
     patch_save_dir,
     metrics_dir,
+    plots_dir,
     device,
 ):
     """
@@ -247,7 +253,7 @@ def evaluate_split(
     plot_gts      = []
     plot_ids      = []
 
-    for idx, input_path in enumerate(input_paths):
+    for idx, input_path in enumerate(tqdm(input_paths, desc=f"Evaluating {split_name}")):
         img_id = os.path.splitext(os.path.basename(input_path))[0]
         gt_path = os.path.join(gt_dir, os.path.basename(input_path))
 
@@ -411,6 +417,9 @@ def evaluate_split(
             axes[i, 3].axis("off")
 
         plt.tight_layout()
+        plot_path = os.path.join(plots_dir, f"{split_name}_visualization.png")
+        plt.savefig(plot_path)
+        print(f"Saved visualization plot to {plot_path}")
         plt.show()
 
     return results_per_image
@@ -444,6 +453,7 @@ val_results = evaluate_split(
     num_plot_examples=NUM_PLOT_EXAMPLES_VAL,
     patch_save_dir=PATCH_SAVE_DIR,
     metrics_dir=METRICS_DIR,
+    plots_dir=PLOTS_DIR,
     device=DEVICE,
 )
 
@@ -459,6 +469,7 @@ if TEST_DIR and os.path.isdir(TEST_DIR):
         num_plot_examples=NUM_PLOT_EXAMPLES_TEST,
         patch_save_dir=PATCH_SAVE_DIR,
         metrics_dir=METRICS_DIR,
+        plots_dir=PLOTS_DIR,
         device=DEVICE,
     )
 else:
