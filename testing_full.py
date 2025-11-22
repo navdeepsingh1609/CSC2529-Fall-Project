@@ -347,8 +347,7 @@ def evaluate_split(
         print(f"  Student -> PSNR: {psnr_student:.2f}, SSIM: {ssim_student:.4f}, LPIPS: {lpips_student:.4f}, Time: {s_time*1000:.2f} ms")
 
         # 9) Save 4-ch patches as .npy (in original [0,1023] scale)
-        np.save(os.path.join(patch_save_dir, f"{split_name}_{img_id}_input_patch.npy"),   inp_patch_4ch)
-        np.save(os.path.join(patch_save_dir, f"{split_name}_{img_id}_gt_patch.npy"),      gt_patch_4ch)
+        # Note: Input and GT are already in Drive, so we only save model outputs.
         np.save(os.path.join(patch_save_dir, f"{split_name}_{img_id}_teacher_patch.npy"), teacher_4n * 1023.0)
         np.save(os.path.join(patch_save_dir, f"{split_name}_{img_id}_student_patch.npy"), student_4n * 1023.0)
 
