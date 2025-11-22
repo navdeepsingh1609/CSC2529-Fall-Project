@@ -38,11 +38,11 @@ PATCH_SIZE = 256
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Where to save 4-channel patches (input / GT / teacher / student)
-PATCH_SAVE_DIR = "patch_outputs_full"
+PATCH_SAVE_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT/results_full/patches"
 os.makedirs(PATCH_SAVE_DIR, exist_ok=True)
 
 # Where to save CSV metrics
-METRICS_DIR = "metrics_full"
+METRICS_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT/results_full/metrics"
 os.makedirs(METRICS_DIR, exist_ok=True)
 
 # ===================================================
