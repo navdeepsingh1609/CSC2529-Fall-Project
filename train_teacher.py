@@ -42,7 +42,7 @@ if mambair_path not in sys.path:
 
 from datasets.udc_dataset import UDCDataset
 from models.mambair_teacher import FrequencyAwareTeacher
-from losses.frequency_loss import FFTAmplitudeLoss
+from losses.frequency_loss import FFTAmpPhaseMultiScaleLoss
 from losses.pixel_loss import CharbonnierLoss
 
 
@@ -245,10 +245,13 @@ def main():
     print("--- [train_teacher] Initializing losses...")
     pixel_loss_fn = CharbonnierLoss().to(device)
     perceptual_loss_fn = lpips.LPIPS(net='vgg').to(device)
-    fft_loss_fn = FFTAmplitudeLoss(
+    fft_loss_fn = FFTAmpPhaseMultiScaleLoss(
         loss_weight=1.0,
         focus_low_freq=True,
-        cutoff=0.25
+        cutoff=0.25,
+        lambda_amp=1.0,
+        lambda_phase=0.5,
+        scales=(1.0, 0.5)
     ).to(device)
 
     # Loss weights (same as earlier)
