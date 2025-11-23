@@ -3,6 +3,7 @@ import os
 import sys
 import argparse
 import csv
+import time
 from glob import glob
 
 import numpy as np
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 from torch import amp
 from torch.cuda import is_available as cuda_is_available
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 import lpips
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
@@ -23,6 +25,34 @@ if MAMBAIR_PATH not in sys.path:
 
 from models.mambair_teacher import FrequencyAwareTeacher
 from models.unet_student import UNetStudent
+
+
+def bayer4_to_rgb_balanced(arr_4ch, r_gain: float = 1.9, b_gain: float = 1.9):
+    """
+    Balanced Bayer-to-RGB view used for visualization (and LPIPS in testing_full.py).
+
+    Accepts (H,W,4) or (4,H,W) in [0,1] or [0,1023] and returns (H,W,3) in [0,1].
+    """
+    arr = np.asarray(arr_4ch, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D array, got shape {arr.shape}")
+
+    if arr.shape[0] == 4:
+        GR, R, B, GB = arr
+    elif arr.shape[-1] == 4:
+        GR = arr[..., 0]
+        R = arr[..., 1]
+        B = arr[..., 2]
+        GB = arr[..., 3]
+    else:
+        raise ValueError(f"Expected channel dim of 4, got shape {arr.shape}")
+
+    scale = 1023.0 if arr.max() > 2.0 else 1.0
+    G = (GR + GB) / (2.0 * scale)
+    Rn = (R / scale) * r_gain
+    Bn = (B / scale) * b_gain
+    rgb = np.stack([Rn, G, Bn], axis=-1)
+    return np.clip(rgb, 0.0, 1.0)
 
 
 def load_full_npy_pair(input_path: str, gt_path: str):
@@ -205,6 +235,8 @@ def evaluate_model_on_split(
     drive_results_root: str,
     save_npy: bool,
     use_tiling: bool,
+    eval_mode: str,
+    num_plot_examples: int,
     lpips_model: lpips.LPIPS,
     device: torch.device,
 ):
@@ -215,6 +247,9 @@ def evaluate_model_on_split(
         - 4-ch predictions as .npy in [0, 1023] if save_npy=True
         - metrics_raw.csv and metrics_summary.txt
         - copies same to Drive (including npy dir) if drive_results_root is provided
+        - optional visualization panels (balanced Bayer->RGB) for first num_plot_examples
+    Args:
+        eval_mode: "full" uses full-image/tiled inference; "center_patch" runs only on a center crop of size patch_size.
     """
     input_dir = os.path.join(data_root, split, "input")
     gt_dir = os.path.join(data_root, split, "GT")
@@ -231,6 +266,7 @@ def evaluate_model_on_split(
     num_images = len(input_files)
     print(f"Data root: {data_root}")
     print(f"Num images: {num_images}")
+    print(f"Eval mode: {eval_mode}")
 
     # Build model
     if model_type == "teacher":
@@ -261,7 +297,10 @@ def evaluate_model_on_split(
     summary_path = os.path.join(model_result_dir, "metrics_summary.txt")
 
     rows = []
-    psnr_list, ssim_list, lpips_list = [], [], []
+    psnr_list, ssim_list, lpips_list, time_list = [], [], [], []
+
+    # For visualization panels
+    plot_inputs, plot_preds, plot_gts, plot_ids = [], [], [], []
 
     pbar = tqdm(input_files, desc=f"[{model_name}] images", unit="img")
     for inp_path in pbar:
@@ -271,18 +310,54 @@ def evaluate_model_on_split(
             print(f"[{model_name}] WARNING: GT missing for {base}, skipping.")
             continue
 
-        udc_full, gt_full = load_full_npy_pair(inp_path, gt_path)
-        udc_full = udc_full.to(device)
+        # --- Data loading based on eval_mode ---
+        if eval_mode == "center_patch":
+            arr_inp = np.load(inp_path).astype(np.float32)
+            arr_gt = np.load(gt_path).astype(np.float32)
+            H, W, _ = arr_inp.shape
+            ps = patch_size
+            if ps > H or ps > W:
+                raise ValueError(f"Patch size {ps} exceeds image size {(H, W)} for {base}")
+            r0 = (H - ps) // 2
+            c0 = (W - ps) // 2
+            r1, c1 = r0 + ps, c0 + ps
+            inp_patch = arr_inp[r0:r1, c0:c1, :]
+            gt_patch = arr_gt[r0:r1, c0:c1, :]
 
-        # Inference
-        pred_full = run_model_full_image(
-            model=model,
-            udc_full_4ch=udc_full,
-            device=device,
-            use_tiling=use_tiling,
-            patch_size=patch_size,
-            patch_batch=patch_batch,
-        ).cpu()
+            udc_full = torch.from_numpy(inp_patch).permute(2, 0, 1).float() / 1023.0
+            gt_full = torch.from_numpy(gt_patch).permute(2, 0, 1).float() / 1023.0
+            udc_full = udc_full.to(device)
+            gt_full = gt_full.to(device)
+
+            start_time = time.perf_counter()
+            with torch.no_grad(), amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
+                pred_full, *_ = model(udc_full.unsqueeze(0))
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start_time
+            pred_full = pred_full.squeeze(0).cpu()
+            udc_full = udc_full.cpu()
+            gt_full = gt_full.cpu()
+        else:
+            udc_full, gt_full = load_full_npy_pair(inp_path, gt_path)
+            udc_full = udc_full.to(device)
+
+            # Inference with timing (sync on CUDA for accurate measurement)
+            start_time = time.perf_counter()
+            pred_full = run_model_full_image(
+                model=model,
+                udc_full_4ch=udc_full,
+                device=device,
+                use_tiling=use_tiling,
+                patch_size=patch_size,
+                patch_batch=patch_batch,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start_time
+            pred_full = pred_full.cpu()
+            udc_full = udc_full.cpu()
+            gt_full = gt_full.cpu()
 
         # Save predictions as 4-ch .npy in [0,1023]
         if save_npy and npy_out_dir is not None:
@@ -295,6 +370,7 @@ def evaluate_model_on_split(
         psnr_list.append(psnr)
         ssim_list.append(ssim)
         lpips_list.append(lpv)
+        time_list.append(elapsed)
 
         rows.append(
             {
@@ -302,6 +378,7 @@ def evaluate_model_on_split(
                 "psnr_bayer": psnr,
                 "ssim_bayer": ssim,
                 "lpips_rgb": lpv,
+                "time_ms": elapsed * 1000.0,
             }
         )
 
@@ -310,12 +387,22 @@ def evaluate_model_on_split(
                 "PSNR": f"{psnr:.2f}",
                 "SSIM": f"{ssim:.3f}",
                 "LPIPS": f"{lpv:.3f}",
+                "time_ms": f"{elapsed*1000.0:.1f}",
             }
         )
 
+        # Collect a few samples for visualization using balanced Bayer->RGB
+        if len(plot_inputs) < num_plot_examples:
+            plot_ids.append(base)
+            plot_inputs.append(bayer4_to_rgb_balanced(udc_full.cpu().numpy()))
+            plot_preds.append(bayer4_to_rgb_balanced(pred_full.cpu().numpy()))
+            plot_gts.append(bayer4_to_rgb_balanced(gt_full.cpu().numpy()))
+
     # Save CSV
     with open(metrics_csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["filename", "psnr_bayer", "ssim_bayer", "lpips_rgb"])
+        writer = csv.DictWriter(
+            f, fieldnames=["filename", "psnr_bayer", "ssim_bayer", "lpips_rgb", "time_ms"]
+        )
         writer.writeheader()
         for r in rows:
             writer.writerow(r)
@@ -323,6 +410,7 @@ def evaluate_model_on_split(
     mean_psnr = float(np.mean(psnr_list)) if psnr_list else float("nan")
     mean_ssim = float(np.mean(ssim_list)) if ssim_list else float("nan")
     mean_lpips = float(np.mean(lpips_list)) if lpips_list else float("nan")
+    mean_time_ms = float(np.mean(time_list) * 1000.0) if time_list else float("nan")
 
     with open(summary_path, "w") as f:
         f.write(f"Model: {model_name}\n")
@@ -332,13 +420,43 @@ def evaluate_model_on_split(
         f.write(f"Mean PSNR (Bayer): {mean_psnr:.4f} dB\n")
         f.write(f"Mean SSIM (Bayer): {mean_ssim:.4f}\n")
         f.write(f"Mean LPIPS (RGB):  {mean_lpips:.4f}\n")
+        f.write(f"Mean Inference Time: {mean_time_ms:.3f} ms\n")
 
     print(f"\n--- [testing_udc] {model_name} results on '{split}':")
     print(f"Mean PSNR (Bayer): {mean_psnr:.4f} dB")
     print(f"Mean SSIM (Bayer): {mean_ssim:.4f}")
     print(f"Mean LPIPS (RGB):  {mean_lpips:.4f}")
+    print(f"Mean Inference:    {mean_time_ms:.3f} ms")
     print(f"Saved CSV to {metrics_csv_path}")
     print(f"Saved summary to {summary_path}")
+
+    # Visualization panels using balanced Bayer->RGB
+    vis_path = None
+    if plot_inputs:
+        rows = len(plot_inputs)
+        cols = 3  # Input, Prediction, GT
+        fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
+        if rows == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        for i in range(rows):
+            axes[i, 0].imshow(plot_inputs[i])
+            axes[i, 0].set_title(f"{plot_ids[i]} - Input")
+            axes[i, 0].axis("off")
+
+            axes[i, 1].imshow(plot_preds[i])
+            axes[i, 1].set_title("Prediction")
+            axes[i, 1].axis("off")
+
+            axes[i, 2].imshow(plot_gts[i])
+            axes[i, 2].set_title("GT")
+            axes[i, 2].axis("off")
+
+        plt.tight_layout()
+        vis_path = os.path.join(model_result_dir, f"{model_name}_{split}_visualization.png")
+        plt.savefig(vis_path, dpi=150)
+        plt.close(fig)
+        print(f"Saved visualization plot to {vis_path}")
 
     # Copy metrics + npy predictions to Drive
     if drive_results_root is not None and len(drive_results_root) > 0:
@@ -349,6 +467,8 @@ def evaluate_model_on_split(
 
         shutil.copy(metrics_csv_path, os.path.join(drive_model_dir, "metrics_raw.csv"))
         shutil.copy(summary_path, os.path.join(drive_model_dir, "metrics_summary.txt"))
+        if vis_path is not None:
+            shutil.copy(vis_path, os.path.join(drive_model_dir, os.path.basename(vis_path)))
 
         if save_npy and npy_out_dir is not None and os.path.isdir(npy_out_dir):
             drive_npy_dir = os.path.join(drive_model_dir, "npy")
@@ -378,7 +498,7 @@ def parse_args():
         "--patch-size",
         type=int,
         default=256,
-        help="Patch size for tiled inference.",
+        help="Patch size for tiled inference or center-patch eval (see --eval-mode).",
     )
     parser.add_argument(
         "--patch-batch",
@@ -422,6 +542,19 @@ def parse_args():
         help="Disable saving 4-ch prediction .npy files.",
     )
     parser.add_argument(
+        "--num-plot-examples",
+        type=int,
+        default=0,
+        help="Number of examples to visualize per model/split (balanced Bayer->RGB).",
+    )
+    parser.add_argument(
+        "--eval-mode",
+        type=str,
+        default="full",
+        choices=["full", "center_patch"],
+        help="full: run on entire image (full or tiled). center_patch: evaluate only the center patch of size --patch-size.",
+    )
+    parser.add_argument(
         "--use-tiling",
         action="store_true",
         help="Force tiled inference even when full-image inference might be possible.",
@@ -453,6 +586,8 @@ def main():
     print(f"Student ckpt:   {args.student_ckpt}")
     print(f"Results root:   {args.results_root}")
     print(f"Drive results:  {args.drive_results_root}")
+    print(f"Plot examples:  {args.num_plot_examples}")
+    print(f"Eval mode:      {args.eval_mode}")
     print(f"Use tiling:     {args.use_tiling}")
     print(f"Save NPY:       {not args.no_save_npy}")
     print(f"Device:         {device.type}")
@@ -498,6 +633,8 @@ def main():
             drive_results_root=args.drive_results_root,
             save_npy=not args.no_save_npy,
             use_tiling=args.use_tiling,
+            eval_mode=args.eval_mode,
+            num_plot_examples=args.num_plot_examples,
             lpips_model=lpips_model,
             device=device,
         )
