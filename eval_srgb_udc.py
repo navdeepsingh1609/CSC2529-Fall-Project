@@ -105,6 +105,18 @@ def apply_gamma(rgb: np.ndarray, gamma: float = 1.0) -> np.ndarray:
     return np.power(rgb, 1.0 / gamma)
 
 
+def center_crop(arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """
+    Center-crop an array (H,W,C) to (target_h, target_w, C).
+    """
+    H, W = arr.shape[:2]
+    if H == target_h and W == target_w:
+        return arr
+    top = max((H - target_h) // 2, 0)
+    left = max((W - target_w) // 2, 0)
+    return arr[top : top + target_h, left : left + target_w, ...]
+
+
 def compute_psnr_ssim(gt_rgb: np.ndarray, pred_rgb: np.ndarray):
     """
     Compute PSNR and SSIM for two sRGB images in [0,1].
@@ -271,28 +283,44 @@ def main():
         # Load 4-ch arrays
         gt_arr = np.load(gt_path)  # (H,W,4) in [0,1023]
         inp_arr = np.load(inp_path)
+        teacher_arr = np.load(teacher_path) if teacher_path is not None else None
+        student_arr = np.load(student_path) if student_path is not None else None
+
+        # Align shapes (center crop to smallest H/W among available arrays)
+        Hs = [gt_arr.shape[0], inp_arr.shape[0]]
+        Ws = [gt_arr.shape[1], inp_arr.shape[1]]
+        if teacher_arr is not None:
+            Hs.append(teacher_arr.shape[0]); Ws.append(teacher_arr.shape[1])
+        if student_arr is not None:
+            Hs.append(student_arr.shape[0]); Ws.append(student_arr.shape[1])
+        target_h, target_w = min(Hs), min(Ws)
+
+        gt_arr = center_crop(gt_arr, target_h, target_w)
+        inp_arr = center_crop(inp_arr, target_h, target_w)
+        if teacher_arr is not None:
+            teacher_arr = center_crop(teacher_arr, target_h, target_w)
+        if student_arr is not None:
+            student_arr = center_crop(student_arr, target_h, target_w)
 
         # Pseudo-RGB (existing)
         inp_rgb_p = apply_gamma(apply_white_balance(fourch_to_rgb(inp_arr), args.wb_mode), args.gamma)
         gt_rgb_p = apply_gamma(apply_white_balance(fourch_to_rgb(gt_arr), args.wb_mode), args.gamma)
-        teacher_rgb_p = None
-        if teacher_path is not None:
-            teacher_arr = np.load(teacher_path)
-            teacher_rgb_p = apply_gamma(
-                apply_white_balance(fourch_to_rgb(teacher_arr), args.wb_mode), args.gamma
-            )
-        student_rgb_p = None
-        if student_path is not None:
-            student_arr = np.load(student_path)
-            student_rgb_p = apply_gamma(
-                apply_white_balance(fourch_to_rgb(student_arr), args.wb_mode), args.gamma
-            )
+        teacher_rgb_p = (
+            apply_gamma(apply_white_balance(fourch_to_rgb(teacher_arr), args.wb_mode), args.gamma)
+            if teacher_arr is not None
+            else None
+        )
+        student_rgb_p = (
+            apply_gamma(apply_white_balance(fourch_to_rgb(student_arr), args.wb_mode), args.gamma)
+            if student_arr is not None
+            else None
+        )
 
         # Naive RGB
         inp_rgb_n = naive_bayer4_to_rgb(inp_arr)
         gt_rgb_n = naive_bayer4_to_rgb(gt_arr)
-        teacher_rgb_n = naive_bayer4_to_rgb(np.load(teacher_path)) if teacher_path is not None else None
-        student_rgb_n = naive_bayer4_to_rgb(np.load(student_path)) if student_path is not None else None
+        teacher_rgb_n = naive_bayer4_to_rgb(teacher_arr) if teacher_arr is not None else None
+        student_rgb_n = naive_bayer4_to_rgb(student_arr) if student_arr is not None else None
 
         # Naive RGB + WB + Gamma
         inp_rgb_ng = apply_wb_gamma(inp_rgb_n)
