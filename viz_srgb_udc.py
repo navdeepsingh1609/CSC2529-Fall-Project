@@ -34,6 +34,33 @@ def fourch_to_rgb(arr_4ch: np.ndarray) -> np.ndarray:
     return rgb
 
 
+def bayer4_to_rgb_balanced(arr_4ch: np.ndarray, r_gain: float = 1.9, b_gain: float = 1.9) -> np.ndarray:
+    """
+    Balanced Bayer→RGB used in testing script (reduces pink/green tint).
+    Accepts (H,W,4) or (4,H,W) in [0,1] or [0,1023]; returns (H,W,3) in [0,1].
+    """
+    arr = np.asarray(arr_4ch, dtype=np.float32)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D array, got {arr.shape}")
+
+    if arr.shape[0] == 4:
+        GR, R, B, GB = arr
+    elif arr.shape[-1] == 4:
+        GR = arr[..., 0]
+        R = arr[..., 1]
+        B = arr[..., 2]
+        GB = arr[..., 3]
+    else:
+        raise ValueError(f"Expected channel dim 4, got {arr.shape}")
+
+    scale = 1023.0 if arr.max() > 2.0 else 1.0
+    G = (GR + GB) / (2.0 * scale)
+    Rn = (R / scale) * r_gain
+    Bn = (B / scale) * b_gain
+    rgb = np.stack([Rn, G, Bn], axis=-1)
+    return np.clip(rgb, 0.0, 1.0)
+
+
 def apply_white_balance(rgb: np.ndarray, mode: str = "none") -> np.ndarray:
     """
     Simple white-balance correction applied to an sRGB image in [0,1].
@@ -249,18 +276,19 @@ def main():
         gt_arr = np.load(gt_path)
         inp_arr = np.load(inp_path)
 
-        inp_rgb = fourch_to_rgb(inp_arr)
-        gt_rgb = fourch_to_rgb(gt_arr)
+        # Balanced Bayer->RGB (matches testing script, reduces tint)
+        inp_rgb = bayer4_to_rgb_balanced(inp_arr)
+        gt_rgb = bayer4_to_rgb_balanced(gt_arr)
 
         teacher_rgb = None
         if teacher_path is not None:
             teacher_arr = np.load(teacher_path)
-            teacher_rgb = fourch_to_rgb(teacher_arr)
+            teacher_rgb = bayer4_to_rgb_balanced(teacher_arr)
 
         student_rgb = None
         if student_path is not None:
             student_arr = np.load(student_path)
-            student_rgb = fourch_to_rgb(student_arr)
+            student_rgb = bayer4_to_rgb_balanced(student_arr)
 
         # WB + gamma
         inp_rgb = apply_gamma(apply_white_balance(inp_rgb, args.wb_mode), args.gamma)
