@@ -186,6 +186,11 @@ def main():
         else args.drive_results_root
     )
 
+    # Avoid Drive copy when paths are identical
+    if drive_results_root and os.path.abspath(drive_results_root) == os.path.abspath(results_root):
+        print("[viz_srgb_udc] Drive results root equals local results root; skipping Drive copy.")
+        drive_results_root = None
+
     input_dir = os.path.join(args.data_root, args.split, "input")
     gt_dir = os.path.join(args.data_root, args.split, "GT")
 

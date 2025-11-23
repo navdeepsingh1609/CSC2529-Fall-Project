@@ -458,21 +458,27 @@ def evaluate_model_on_split(
         plt.close(fig)
         print(f"Saved visualization plot to {vis_path}")
 
-    # Copy metrics + npy predictions to Drive
+    # Copy metrics + npy predictions to Drive (skip if same path)
     if drive_results_root is not None and len(drive_results_root) > 0:
         import shutil
 
         drive_model_dir = os.path.join(drive_results_root, f"{model_name}_{split}")
         os.makedirs(drive_model_dir, exist_ok=True)
 
-        shutil.copy(metrics_csv_path, os.path.join(drive_model_dir, "metrics_raw.csv"))
-        shutil.copy(summary_path, os.path.join(drive_model_dir, "metrics_summary.txt"))
+        def copy_if_needed(src, dst):
+            if os.path.abspath(src) == os.path.abspath(dst):
+                return
+            shutil.copy(src, dst)
+
+        copy_if_needed(metrics_csv_path, os.path.join(drive_model_dir, "metrics_raw.csv"))
+        copy_if_needed(summary_path, os.path.join(drive_model_dir, "metrics_summary.txt"))
         if vis_path is not None:
-            shutil.copy(vis_path, os.path.join(drive_model_dir, os.path.basename(vis_path)))
+            copy_if_needed(vis_path, os.path.join(drive_model_dir, os.path.basename(vis_path)))
 
         if save_npy and npy_out_dir is not None and os.path.isdir(npy_out_dir):
             drive_npy_dir = os.path.join(drive_model_dir, "npy")
-            shutil.copytree(npy_out_dir, drive_npy_dir, dirs_exist_ok=True)
+            if os.path.abspath(npy_out_dir) != os.path.abspath(drive_npy_dir):
+                shutil.copytree(npy_out_dir, drive_npy_dir, dirs_exist_ok=True)
 
         print(f"Copied results to Drive: {drive_model_dir}")
 
@@ -585,6 +591,11 @@ def main():
         if args.drive_results_root is not None and len(args.drive_results_root) > 0 and args.results_name
         else args.drive_results_root
     )
+
+    # If Drive root equals local root, skip mirroring to avoid copy collisions
+    if drive_results_root and os.path.abspath(drive_results_root) == os.path.abspath(results_root):
+        print("[testing_udc] Drive results root equals local results root; skipping Drive copy.")
+        drive_results_root = None
 
     os.makedirs(results_root, exist_ok=True)
     if drive_results_root is not None and len(str(drive_results_root)) > 0:
