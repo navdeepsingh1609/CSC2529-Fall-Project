@@ -4,7 +4,7 @@ Unified student KD training script for UDC-SIT.
 
 - Trains UNetStudent with:
     * Pixel loss (Charbonnier)
-    * Feature KD (spatial + freq via FFTAmplitudeLoss)
+    * Feature KD (spatial + freq via FFTAmpPhaseMultiScaleLoss: amp + phase)
     * LPIPS on pseudo-RGB
 - Teacher is frozen FrequencyAwareTeacher, loaded from --teacher-weights.
 
@@ -57,6 +57,12 @@ def parse_args():
     )
 
     # Data
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default=None,
+        help="Base dataset directory containing 'training' and 'validation' subfolders. If set, overrides --train-dir/--val-dir.",
+    )
     parser.add_argument(
         "--train-dir",
         type=str,
@@ -135,6 +141,23 @@ def parse_args():
         default="/content/drive/MyDrive/Computational Imaging Project/checkpoints",
         help="Google Drive directory where checkpoints & logs are mirrored.",
     )
+    parser.add_argument(
+        "--force-train",
+        action="store_true",
+        help="Ignore existing student checkpoints and train from scratch/full schedule.",
+    )
+    parser.add_argument(
+        "--save-loss-history",
+        dest="save_loss_history",
+        action="store_true",
+        help="Save loss history npz/plots (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-save-loss-history",
+        dest="save_loss_history",
+        action="store_false",
+        help="Disable saving loss history artifacts.",
+    )
 
     # Optional preset
     parser.add_argument(
@@ -148,6 +171,7 @@ def parse_args():
         ),
     )
 
+    parser.set_defaults(save_loss_history=True, force_train=False)
     return parser.parse_args()
 
 
@@ -206,14 +230,35 @@ def build_dataloaders(args, device):
     return train_loader, val_loader
 
 
+def load_existing_checkpoint(model, candidate_paths, device, tag):
+    """
+    Try to load the first existing checkpoint from candidate_paths.
+    Returns the path used, or None if nothing was loaded.
+    """
+    for ckpt_path in candidate_paths:
+        if ckpt_path and os.path.exists(ckpt_path):
+            state = torch.load(ckpt_path, map_location=device)
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            model.load_state_dict(state)
+            print(f"--- [{tag}] Found existing checkpoint at {ckpt_path}. Using it (warm start).")
+            return ckpt_path
+    return None
+
+
 def main():
     args = parse_args()
     args = maybe_apply_preset(args)
+    if args.data_root:
+        args.train_dir = os.path.join(args.data_root, "training")
+        args.val_dir = os.path.join(args.data_root, "validation")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.drive_checkpoint_dir, exist_ok=True)
 
     print("\n--- [train_student_kd] Configuration ---")
+    if args.data_root:
+        print(f"Data Root: {args.data_root}")
     print(f"Train Dir: {args.train_dir}")
     print(f"Val Dir:   {args.val_dir}")
     print(f"Patch Size: {args.patch_size}, Batch Size: {args.batch_size}")
@@ -224,6 +269,7 @@ def main():
     print(f"Drive ckpt dir:    {args.drive_checkpoint_dir}")
     print(f"Max train images:  {args.max_train_images}")
     print(f"Max val images:    {args.max_val_images}")
+    print(f"Force train:       {args.force_train}")
     print("-----------------------------------\n")
 
     if not os.path.exists(args.teacher_weights):
@@ -237,6 +283,7 @@ def main():
     ckpt_latest_local = f"{prefix}_latest.pth"
     ckpt_final_local  = f"{prefix}_final.pth"
     ckpt_latest_drive = os.path.join(args.drive_checkpoint_dir, f"{prefix}_latest.pth")
+    ckpt_final_drive  = os.path.join(args.drive_checkpoint_dir, f"{prefix}_final.pth")
     ckpt_best_drive   = os.path.join(args.drive_checkpoint_dir, f"{prefix}_best.pth")
 
     loss_hist_local = f"{prefix}_loss_history.npz"
@@ -261,6 +308,15 @@ def main():
     # Student
     print("--- [train_student_kd] Initializing student model...")
     student = UNetStudent(in_channels=4, out_channels=4).to(device)
+    if not args.force_train:
+        candidate_ckpts = [
+            ckpt_final_drive,
+            ckpt_final_local,
+            ckpt_best_drive,
+            ckpt_latest_drive,
+            ckpt_latest_local,
+        ]
+        load_existing_checkpoint(student, candidate_ckpts, device, "train_student_kd")
 
     # Losses
     print("--- [train_student_kd] Initializing losses...")
@@ -401,43 +457,45 @@ def main():
             print(f"New best val loss. Saved best student checkpoint to {ckpt_best_drive}")
 
         # Save loss history each epoch
-        np.savez(
-            loss_hist_local,
-            train_loss=np.array(train_loss_history, dtype=np.float32),
-            val_loss=np.array(val_loss_history,   dtype=np.float32),
-        )
-        np.savez(
-            loss_hist_drive,
-            train_loss=np.array(train_loss_history, dtype=np.float32),
-            val_loss=np.array(val_loss_history,   dtype=np.float32),
-        )
+        if args.save_loss_history:
+            np.savez(
+                loss_hist_local,
+                train_loss=np.array(train_loss_history, dtype=np.float32),
+                val_loss=np.array(val_loss_history,   dtype=np.float32),
+            )
+            np.savez(
+                loss_hist_drive,
+                train_loss=np.array(train_loss_history, dtype=np.float32),
+                val_loss=np.array(val_loss_history,   dtype=np.float32),
+            )
 
     # Final named checkpoint
     torch.save(student.state_dict(), ckpt_final_local)
-    torch.save(student.state_dict(), os.path.join(args.drive_checkpoint_dir, ckpt_final_local))
+    torch.save(student.state_dict(), ckpt_final_drive)
     print(f"--- [train_student_kd] Final student saved as {ckpt_final_local} locally and on Drive")
 
     # Final loss curves plot
-    epochs = np.arange(1, len(train_loss_history) + 1)
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.plot(epochs, train_loss_history, label="Train")
-    ax.plot(epochs, val_loss_history,   label="Val")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss (KD total: pixel + feat + freq + LPIPS)")
-    ax.set_title("Student KD Training & Validation Loss")
-    ax.grid(True)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(loss_plot_local, dpi=150)
-    plt.close(fig)
+    if args.save_loss_history:
+        epochs = np.arange(1, len(train_loss_history) + 1)
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.plot(epochs, train_loss_history, label="Train")
+        ax.plot(epochs, val_loss_history,   label="Val")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss (KD total: pixel + feat + freq + LPIPS)")
+        ax.set_title("Student KD Training & Validation Loss")
+        ax.grid(True)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(loss_plot_local, dpi=150)
+        plt.close(fig)
 
-    # Copy plot to Drive
-    try:
-        import shutil
-        shutil.copy(loss_plot_local, loss_plot_drive)
-        print(f"Saved loss curves plot to {loss_plot_local} and {loss_plot_drive}")
-    except Exception as e:
-        print(f"Could not copy loss plot to Drive: {e}")
+        # Copy plot to Drive
+        try:
+            import shutil
+            shutil.copy(loss_plot_local, loss_plot_drive)
+            print(f"Saved loss curves plot to {loss_plot_local} and {loss_plot_drive}")
+        except Exception as e:
+            print(f"Could not copy loss plot to Drive: {e}")
 
 
 if __name__ == "__main__":
