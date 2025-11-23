@@ -527,13 +527,19 @@ def parse_args():
     parser.add_argument(
         "--results-root",
         type=str,
-        default="results_quick",
+        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model2",
         help="Local directory to store metrics and predictions.",
+    )
+    parser.add_argument(
+        "--results-name",
+        type=str,
+        default="run1",
+        help="Subfolder name created under both results roots for this run.",
     )
     parser.add_argument(
         "--drive-results-root",
         type=str,
-        default="/content/drive/MyDrive/Computational Imaging Project/results_quick",
+        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model2",
         help="Google Drive directory to mirror metrics and NPY predictions. Leave empty to disable.",
     )
     parser.add_argument(
@@ -572,9 +578,17 @@ def main():
     args = parse_args()
     device = torch.device(args.device)
 
-    os.makedirs(args.results_root, exist_ok=True)
-    if args.drive_results_root is not None and len(args.drive_results_root) > 0:
-        os.makedirs(args.drive_results_root, exist_ok=True)
+    # Compose final output roots (local + Drive) with optional run subfolder
+    results_root = os.path.join(args.results_root, args.results_name) if args.results_name else args.results_root
+    drive_results_root = (
+        os.path.join(args.drive_results_root, args.results_name)
+        if args.drive_results_root is not None and len(args.drive_results_root) > 0 and args.results_name
+        else args.drive_results_root
+    )
+
+    os.makedirs(results_root, exist_ok=True)
+    if drive_results_root is not None and len(str(drive_results_root)) > 0:
+        os.makedirs(drive_results_root, exist_ok=True)
 
     print("\n--- [testing_udc] Configuration ---")
     print(f"Data root:      {args.data_root}")
@@ -584,8 +598,8 @@ def main():
     print(f"Max images:     {args.max_images}")
     print(f"Teacher ckpt:   {args.teacher_ckpt}")
     print(f"Student ckpt:   {args.student_ckpt}")
-    print(f"Results root:   {args.results_root}")
-    print(f"Drive results:  {args.drive_results_root}")
+    print(f"Results root:   {results_root}")
+    print(f"Drive results:  {drive_results_root}")
     print(f"Plot examples:  {args.num_plot_examples}")
     print(f"Eval mode:      {args.eval_mode}")
     print(f"Use tiling:     {args.use_tiling}")
@@ -629,8 +643,8 @@ def main():
             patch_size=args.patch_size,
             patch_batch=args.patch_batch,
             max_images=args.max_images,
-            results_root=args.results_root,
-            drive_results_root=args.drive_results_root,
+            results_root=results_root,
+            drive_results_root=drive_results_root,
             save_npy=not args.no_save_npy,
             use_tiling=args.use_tiling,
             eval_mode=args.eval_mode,

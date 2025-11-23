@@ -145,13 +145,19 @@ def parse_args():
     parser.add_argument(
         "--results-root",
         type=str,
-        default="results_srgb_viz",
+        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model2",
         help="Local directory to store visualization PNGs.",
+    )
+    parser.add_argument(
+        "--results-name",
+        type=str,
+        default="run1",
+        help="Subfolder name created under both results roots for this run.",
     )
     parser.add_argument(
         "--drive-results-root",
         type=str,
-        default="/content/drive/MyDrive/Computational Imaging Project/results_srgb_viz",
+        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model2",
         help="Google Drive directory to mirror visualization PNGs. Leave empty to disable.",
     )
     parser.add_argument(
@@ -173,6 +179,13 @@ def parse_args():
 def main():
     args = parse_args()
 
+    results_root = os.path.join(args.results_root, args.results_name) if args.results_name else args.results_root
+    drive_results_root = (
+        os.path.join(args.drive_results_root, args.results_name)
+        if args.drive_results_root is not None and len(args.drive_results_root) > 0 and args.results_name
+        else args.drive_results_root
+    )
+
     input_dir = os.path.join(args.data_root, args.split, "input")
     gt_dir = os.path.join(args.data_root, args.split, "GT")
 
@@ -184,11 +197,11 @@ def main():
     teacher_dir = args.teacher_pred_dir
     student_dir = args.student_pred_dir
 
-    split_viz_dir = os.path.join(args.results_root, args.split)
+    split_viz_dir = os.path.join(results_root, args.split)
     os.makedirs(split_viz_dir, exist_ok=True)
 
-    if args.drive_results_root is not None and len(args.drive_results_root) > 0:
-        os.makedirs(args.drive_results_root, exist_ok=True)
+    if drive_results_root is not None and len(str(drive_results_root)) > 0:
+        os.makedirs(drive_results_root, exist_ok=True)
 
     print("=== [viz_srgb_udc] Config ===")
     print(f"Data root:      {args.data_root}")
@@ -196,8 +209,8 @@ def main():
     print(f"Teacher preds:  {teacher_dir}")
     print(f"Student preds:  {student_dir}")
     print(f"Max images:     {args.max_images}")
-    print(f"Viz root:       {args.results_root}")
-    print(f"Drive viz root: {args.drive_results_root}")
+    print(f"Viz root:       {results_root}")
+    print(f"Drive viz root: {drive_results_root}")
     print(f"WB mode:        {args.wb_mode}")
     print(f"Gamma:          {args.gamma}")
     print("=================================")
@@ -263,10 +276,10 @@ def main():
         print(f"[viz_srgb_udc] Saved panel: {panel_path}")
 
     # Copy viz to Drive
-    if args.drive_results_root is not None and len(args.drive_results_root) > 0:
+    if drive_results_root is not None and len(str(drive_results_root)) > 0:
         import shutil
 
-        drive_split_dir = os.path.join(args.drive_results_root, args.split)
+        drive_split_dir = os.path.join(drive_results_root, args.split)
         shutil.copytree(split_viz_dir, drive_split_dir, dirs_exist_ok=True)
         print(f"[viz_srgb_udc] Copied panels to Drive: {drive_split_dir}")
 
