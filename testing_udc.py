@@ -1,4 +1,4 @@
-# File: testing_full.py
+# File: testing_udc.py
 import os
 import sys
 import argparse
@@ -17,24 +17,14 @@ import matplotlib.pyplot as plt
 import lpips
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
-# ===================== PATCHES =====================
-# Fix for basicsr compatibility with newer torchvision
-try:
-    from torchvision.transforms import functional as F_trans
-    import sys
-    sys.modules["torchvision.transforms.functional_tensor"] = F_trans
-except ImportError:
-    pass
-
 # Add external MambaIR path if needed (assuming this file lives at repo root)
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 MAMBAIR_PATH = os.path.join(PROJECT_ROOT, "models", "external", "MambaIR")
 if MAMBAIR_PATH not in sys.path:
     sys.path.insert(0, MAMBAIR_PATH)
 
-# Defer imports to allow CLI to run without dependencies
-# from models.mambair_teacher import FrequencyAwareTeacher
-# from models.unet_student import UNetStudent
+from models.mambair_teacher import FrequencyAwareTeacher
+from models.unet_student import UNetStudent
 
 
 def bayer4_to_rgb_balanced(arr_4ch, r_gain: float = 1.9, b_gain: float = 1.9):
@@ -280,12 +270,10 @@ def evaluate_model_on_split(
 
     # Build model
     if model_type == "teacher":
-        from models.mambair_teacher import FrequencyAwareTeacher
         print(f"--- [Teacher] Initializing with 4 in-channels and 4 out-channels.")
         model = FrequencyAwareTeacher(in_channels=4, out_channels=4).to(device)
         print(f"--- [Teacher] Model initialized (MambaIR + Freq residual gating).")
     elif model_type == "student":
-        from models.unet_student import UNetStudent
         print(f"--- [Student] Initializing with 4 in-channels and 4 out-channels.")
         model = UNetStudent(in_channels=4, out_channels=4).to(device)
         print(f"--- [Student] Model initialized with frequency blocks.")
@@ -470,21 +458,27 @@ def evaluate_model_on_split(
         plt.close(fig)
         print(f"Saved visualization plot to {vis_path}")
 
-    # Copy metrics + npy predictions to Drive
+    # Copy metrics + npy predictions to Drive (skip if same path)
     if drive_results_root is not None and len(drive_results_root) > 0:
         import shutil
 
         drive_model_dir = os.path.join(drive_results_root, f"{model_name}_{split}")
         os.makedirs(drive_model_dir, exist_ok=True)
 
-        shutil.copy(metrics_csv_path, os.path.join(drive_model_dir, "metrics_raw.csv"))
-        shutil.copy(summary_path, os.path.join(drive_model_dir, "metrics_summary.txt"))
+        def copy_if_needed(src, dst):
+            if os.path.abspath(src) == os.path.abspath(dst):
+                return
+            shutil.copy(src, dst)
+
+        copy_if_needed(metrics_csv_path, os.path.join(drive_model_dir, "metrics_raw.csv"))
+        copy_if_needed(summary_path, os.path.join(drive_model_dir, "metrics_summary.txt"))
         if vis_path is not None:
-            shutil.copy(vis_path, os.path.join(drive_model_dir, os.path.basename(vis_path)))
+            copy_if_needed(vis_path, os.path.join(drive_model_dir, os.path.basename(vis_path)))
 
         if save_npy and npy_out_dir is not None and os.path.isdir(npy_out_dir):
             drive_npy_dir = os.path.join(drive_model_dir, "npy")
-            shutil.copytree(npy_out_dir, drive_npy_dir, dirs_exist_ok=True)
+            if os.path.abspath(npy_out_dir) != os.path.abspath(drive_npy_dir):
+                shutil.copytree(npy_out_dir, drive_npy_dir, dirs_exist_ok=True)
 
         print(f"Copied results to Drive: {drive_model_dir}")
 
@@ -539,7 +533,7 @@ def parse_args():
     parser.add_argument(
         "--results-root",
         type=str,
-        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model2",
+        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model1",
         help="Local directory to store metrics and predictions.",
     )
     parser.add_argument(
@@ -551,7 +545,7 @@ def parse_args():
     parser.add_argument(
         "--drive-results-root",
         type=str,
-        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model2",
+        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model1",
         help="Google Drive directory to mirror metrics and NPY predictions. Leave empty to disable.",
     )
     parser.add_argument(
@@ -597,6 +591,11 @@ def main():
         if args.drive_results_root is not None and len(args.drive_results_root) > 0 and args.results_name
         else args.drive_results_root
     )
+
+    # If Drive root equals local root, skip mirroring to avoid copy collisions
+    if drive_results_root and os.path.abspath(drive_results_root) == os.path.abspath(results_root):
+        print("[testing_udc] Drive results root equals local results root; skipping Drive copy.")
+        drive_results_root = None
 
     os.makedirs(results_root, exist_ok=True)
     if drive_results_root is not None and len(str(drive_results_root)) > 0:

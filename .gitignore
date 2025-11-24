@@ -16,3 +16,6 @@ data/UDC-SIT_subset/
 .DS_Store
 .vscode/
 .temp/*
+*.html
+architecture_and_workflow.md
+architecture_model2.md
