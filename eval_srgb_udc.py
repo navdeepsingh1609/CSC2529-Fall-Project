@@ -169,7 +169,11 @@ def parse_args():
     parser.add_argument(
         "--results-root",
         type=str,
+<<<<<<< HEAD
         default="/content/drive/MyDrive/Computational Imaging Project/Results/Model1",
+=======
+        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model2",
+>>>>>>> model2
         help="Local directory to store sRGB metric CSV + summary.",
     )
     parser.add_argument(
@@ -181,7 +185,11 @@ def parse_args():
     parser.add_argument(
         "--drive-results-root",
         type=str,
+<<<<<<< HEAD
         default="/content/drive/MyDrive/Computational Imaging Project/Results/Model1",
+=======
+        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model2",
+>>>>>>> model2
         help="Google Drive directory to mirror sRGB metrics. Leave empty to disable.",
     )
     parser.add_argument(
