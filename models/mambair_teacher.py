@@ -8,16 +8,12 @@ from basicsr.archs.mambair_arch import MambaIR as OfficialMambaIR
 
 class FrequencyAwareTeacher(nn.Module):
     """
-    Frequency-aware teacher based on MambaIR + FFT frequency branch.
+    Frequency-aware teacher model combining MambaIR with a frequency domain branch.
 
-    - Spatial branch: Official MambaIR, 4-ch in → 4-ch out (raw Bayer domain).
-    - Frequency branch: FrequencyDomainBlock on the 4-ch raw input.
-    - Fusion: residual-style, freq acts as a gated correction on top of spatial.
-
-    Returns:
-        restored_4ch_output: (B, 4, H, W)
-        spatial_features:    (B, 4, H, W)   # for KD
-        freq_features:       (B, 4, H, W)   # for KD / analysis
+    Architecture:
+    - Spatial Branch: MambaIR backbone processing 4-channel raw input.
+    - Frequency Branch: FrequencyDomainBlock processing 4-channel raw input.
+    - Fusion: Gated residual connection where frequency features modulate spatial features.
     """
     def __init__(
         self,
@@ -29,13 +25,12 @@ class FrequencyAwareTeacher(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        print(f"--- [Teacher] Initializing with {in_channels} in-channels and {out_channels} out-channels.")
-
-        # 1. Spatial branch: MambaIR backbone (4-ch → 4-ch)
+        
+        # 1. Spatial Branch (MambaIR)
         self.spatial_model = OfficialMambaIR(
             img_size=img_size,
             in_chans=in_channels,
-            out_chans=in_channels,  # 4-ch output in Bayer domain
+            out_chans=in_channels,
             embed_dim=embed_dim,
             depths=list(depths),
             num_heads=[3, 6, 12, 24],
@@ -46,48 +41,49 @@ class FrequencyAwareTeacher(nn.Module):
             mlp_ratio=2.0,
         )
 
-        # 2. Frequency branch: FFT block on raw input (4-ch)
-        self.frequency_model = FrequencyDomainBlock(
-            in_channels=in_channels
-        )
+        # 2. Frequency Branch
+        self.frequency_model = FrequencyDomainBlock(in_channels=in_channels)
 
-        # 3. Very lightweight channel gate (global avg pool + 1x1 conv + sigmoid)
+        # 3. Channel Gating (Global Avg Pool + Conv + Sigmoid)
         self.channel_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),                 # (B, C, H, W) -> (B, C, 1, 1)
-            nn.Conv2d(in_channels, in_channels, 1),  # learn per-channel scaling
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, in_channels, 1),
             nn.Sigmoid()
         )
 
-        # 4. Final 1x1 fusion to 4-ch output
+        # 4. Final Fusion
         self.fusion = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-        print("--- [Teacher] Model initialized (MambaIR + Freq residual gating).")
 
     def forward(self, x: torch.Tensor):
         """
+        Forward pass.
+        
         Args:
-            x: (B, 4, H, W) raw UDC-SIT Bayer-like input normalized to [0, 1].
+            x: (B, 4, H, W) Raw UDC-SIT Bayer-like input, normalized to [0, 1].
 
         Returns:
-            restored_4ch_output: (B, 4, H, W)
-            spatial_features:    (B, 4, H, W)
-            freq_features:       (B, 4, H, W)
+            restored_4ch_output: (B, 4, H, W) Final restored output.
+            spatial_features:    (B, 4, H, W) Intermediate spatial features for KD.
+            freq_features:       (B, 4, H, W) Intermediate frequency features for KD.
         """
         # Spatial path: MambaIR
-        spatial_features = self.spatial_model(x)  # (B, 4, H, W)
+        spatial_features = self.spatial_model(x)
 
         # Frequency path: FFT block on raw input
-        freq_features = self.frequency_model(x)   # (B, 4, H, W)
+        freq_features = self.frequency_model(x)
 
-        # Channel-wise gate from spatial features
-        gate = self.channel_gate(spatial_features)    # (B, 4, 1, 1) in [0,1]
-        freq_mod = freq_features * gate               # gated correction
+        # Channel-wise gating
+        gate = self.channel_gate(spatial_features)
+        freq_mod = freq_features * gate
 
-        # Residual fusion: spatial + gated frequency correction
-        fused = spatial_features + freq_mod           # (B, 4, H, W)
+        # Residual fusion
+        fused = spatial_features + freq_mod
 
-        # Final 4-ch output
-        restored_4ch_output = self.fusion(fused)      # (B, 4, H, W)
+        # Final projection
+        restored_4ch_output = self.fusion(fused)
 
-        # For KD we still expose spatial & freq branch outputs
         return restored_4ch_output, spatial_features, freq_features
+
+
+# Alias for backward compatibility if needed
+FrequencyAwareTeacherV2 = FrequencyAwareTeacher

@@ -2,18 +2,14 @@
 """
 Unified teacher training script for UDC-SIT.
 
-- Trains FrequencyAwareTeacher (MambaIR + frequency block) on 4-ch .npy patches.
-- Can run "full" or "quick" training just by changing CLI arguments:
-    * --train-dir / --val-dir
-    * --max-train-images / --max-val-images
-    * --batch-size, --num-epochs
+Trains the FrequencyAwareTeacher (MambaIR + Frequency Branch) on 4-channel .npy patches.
+Supports both 'v1' (Amplitude Loss) and 'v2' (Multi-Scale Amplitude + Phase Loss) variants.
 
-- Saves:
-    * Latest checkpoint          -> <checkpoint_prefix>_latest.pth
-    * Final checkpoint           -> <checkpoint_prefix>_final.pth
-    * Loss history (npz)         -> <checkpoint_prefix>_loss_history.npz
-    * Loss curves (PNG)          -> <checkpoint_prefix>_loss_curves.png
-    * Mirrored into Drive folder -> --drive-checkpoint-dir
+Key Features:
+- Dynamic model variant selection.
+- Mixed-precision training (AMP).
+- Comprehensive logging (Loss history, LPIPS, Checkpoints).
+- Google Drive integration for persistent storage.
 """
 
 import os
@@ -30,20 +26,19 @@ from tqdm import tqdm
 import lpips
 import matplotlib.pyplot as plt
 
-# Speed vs reproducibility: favour speed on Colab
+# Optimize for speed on Colab
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
-# Make sure external MambaIR is visible
+# Ensure MambaIR submodule is in path
 project_root = os.getcwd()
 mambair_path = os.path.join(project_root, 'models', 'external', 'MambaIR')
 if mambair_path not in sys.path:
     sys.path.insert(0, mambair_path)
 
 from datasets.udc_dataset import UDCDataset
-# Will be dynamic later
-from models.mambair_teacher import FrequencyAwareTeacher
-from losses.frequency_loss import FFTAmplitudeLoss
+from models.mambair_teacher import FrequencyAwareTeacher, FrequencyAwareTeacherV2
+from losses.frequency_loss import FFTAmplitudeLoss, FFTAmpPhaseMultiScaleLoss
 from losses.pixel_loss import CharbonnierLoss
 
 
@@ -51,112 +46,117 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Train FrequencyAwareTeacher on UDC-SIT (4-ch .npy patches)."
     )
-    # Data
+    # Model Configuration
+    parser.add_argument(
+        "--model-variant",
+        type=str,
+        choices=["v1", "v2"],
+        default="v1",
+        help="Model variant: 'v1' (Amplitude Loss) or 'v2' (Multi-Scale Phase + Gating).",
+    )
+    
+    # Data Configuration
     parser.add_argument(
         "--data-root",
         type=str,
         default=None,
-        help="Base dataset directory containing 'training' and 'validation' subfolders. If set, overrides --train-dir/--val-dir.",
+        help="Root directory containing 'training' and 'validation' subfolders. Overrides --train-dir/--val-dir.",
     )
     parser.add_argument(
         "--train-dir",
         type=str,
         default="/content/dataset/UDC-SIT/training",
-        help="Training data root containing 'input' and 'GT' subfolders.",
+        help="Training data directory.",
     )
     parser.add_argument(
         "--val-dir",
         type=str,
         default="/content/dataset/UDC-SIT/validation",
-        help="Validation data root containing 'input' and 'GT' subfolders.",
+        help="Validation data directory.",
     )
     parser.add_argument(
         "--patch-size",
         type=int,
         default=256,
-        help="Patch size used by UDCDataset and the teacher model.",
+        help="Input patch size.",
     )
     parser.add_argument(
         "--max-train-images",
         type=int,
         default=None,
-        help="If set, limit number of training images (for quick experiments).",
+        help="Limit training images (for debugging/quick runs).",
     )
     parser.add_argument(
         "--max-val-images",
         type=int,
         default=None,
-        help="If set, limit number of validation images.",
+        help="Limit validation images.",
     )
 
-    # Training hyperparams
+    # Training Hyperparameters
     parser.add_argument(
         "--batch-size",
         type=int,
         default=8,
-        help="Batch size for training.",
+        help="Batch size.",
     )
     parser.add_argument(
         "--num-epochs",
         type=int,
         default=22,
-        help="Number of training epochs.",
+        help="Total training epochs.",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
         default=1e-4,
-        help="Learning rate for Adam optimizer.",
+        help="Initial learning rate.",
     )
     parser.add_argument(
         "--num-workers",
         type=int,
         default=4,
-        help="Number of DataLoader workers.",
+        help="DataLoader worker count.",
     )
 
-    # Checkpointing / logging
+    # Logging & Checkpointing
     parser.add_argument(
         "--checkpoint-prefix",
         type=str,
         default="teacher_4ch",
-        help="Prefix for saved checkpoints and logs.",
+        help="Prefix for output files.",
     )
     parser.add_argument(
         "--drive-checkpoint-dir",
         type=str,
         default="/content/drive/MyDrive/Computational Imaging Project/checkpoints",
-        help="Google Drive directory where checkpoints & logs are mirrored.",
+        help="Drive directory for mirroring checkpoints.",
     )
     parser.add_argument(
         "--force-train",
         action="store_true",
-        help="Ignore any existing checkpoints and train from scratch/full schedule.",
+        help="Overwrite existing checkpoints and train from scratch.",
     )
     parser.add_argument(
         "--save-loss-history",
         dest="save_loss_history",
         action="store_true",
-        help="Save loss history npz/plots (default: enabled).",
+        help="Enable loss history saving (default).",
     )
     parser.add_argument(
         "--no-save-loss-history",
         dest="save_loss_history",
         action="store_false",
-        help="Disable saving loss history artifacts.",
+        help="Disable loss history saving.",
     )
 
-    # Optional preset for convenience
+    # Convenience Presets
     parser.add_argument(
         "--preset",
         type=str,
         choices=["full", "quick"],
         default=None,
-        help=(
-            "Optional convenience preset. "
-            "'full' ~ default args, 'quick' uses small batch/epochs and few images. "
-            "You can still override values explicitly."
-        ),
+        help="Configuration preset: 'quick' (reduced epochs/data) or 'full' (default).",
     )
 
     parser.set_defaults(save_loss_history=True, force_train=False)
@@ -164,9 +164,8 @@ def parse_args():
 
 
 def maybe_apply_preset(args):
-    """Apply convenient defaults for --preset=quick/full without overriding explicit CLI."""
+    """Applies configuration presets if explicit arguments are not provided."""
     if args.preset == "quick":
-        # Only reduce if user left them at default-like values
         if args.batch_size == 8:
             args.batch_size = 2
         if args.num_epochs == 22:
@@ -175,13 +174,12 @@ def maybe_apply_preset(args):
             args.max_train_images = 20
         if args.max_val_images is None:
             args.max_val_images = 10
-    # 'full' just relies on explicit defaults
     return args
 
 
 def build_dataloaders(args, device):
-    """Create train/val DataLoaders with optional Subset limiting."""
-    print("\n--- [train_teacher] Loading datasets ---")
+    """Constructs training and validation DataLoaders."""
+    print("\n--- [Data] Loading Datasets ---")
     train_dataset = UDCDataset(
         args.train_dir,
         patch_size=args.patch_size,
@@ -193,18 +191,16 @@ def build_dataloaders(args, device):
         is_train=False
     )
 
-    # Optional quick-mode limits
+    # Apply subset limits if requested
     if args.max_train_images is not None:
         max_n = min(args.max_train_images, len(train_dataset))
-        indices = list(range(max_n))
-        train_dataset = Subset(train_dataset, indices)
-        print(f"--- [train_teacher] Using only {max_n} training images (Subset).")
+        train_dataset = Subset(train_dataset, list(range(max_n)))
+        print(f"--- [Data] Training subset: {max_n} images.")
 
     if args.max_val_images is not None:
         max_n = min(args.max_val_images, len(val_dataset))
-        indices = list(range(max_n))
-        val_dataset = Subset(val_dataset, indices)
-        print(f"--- [train_teacher] Using only {max_n} validation images (Subset).")
+        val_dataset = Subset(val_dataset, list(range(max_n)))
+        print(f"--- [Data] Validation subset: {max_n} images.")
 
     train_loader = DataLoader(
         train_dataset,
@@ -221,23 +217,19 @@ def build_dataloaders(args, device):
         pin_memory=(device == "cuda"),
     )
 
-    print(f"--- [train_teacher] Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    print(f"--- [Data] Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     return train_loader, val_loader
 
 
 def load_existing_checkpoint(model, candidate_paths, device, tag):
-    """
-    Try to load the first existing checkpoint from candidate_paths.
-    Returns the path used, or None if nothing was loaded.
-    """
+    """Attempts to load model weights from a list of candidate paths."""
     for ckpt_path in candidate_paths:
         if ckpt_path and os.path.exists(ckpt_path):
             state = torch.load(ckpt_path, map_location=device)
-            # Allow both raw state_dict and {"state_dict": ...}
             if isinstance(state, dict) and "state_dict" in state:
                 state = state["state_dict"]
             model.load_state_dict(state)
-            print(f"--- [{tag}] Found existing checkpoint at {ckpt_path}. Using it (warm start).")
+            print(f"--- [{tag}] Resumed from checkpoint: {ckpt_path}")
             return ckpt_path
     return None
 
@@ -245,6 +237,7 @@ def load_existing_checkpoint(model, candidate_paths, device, tag):
 def main():
     args = parse_args()
     args = maybe_apply_preset(args)
+    
     if args.data_root:
         args.train_dir = os.path.join(args.data_root, "training")
         args.val_dir = os.path.join(args.data_root, "validation")
@@ -252,22 +245,17 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.drive_checkpoint_dir, exist_ok=True)
 
-    print("\n--- [train_teacher] Configuration ---")
-    if args.data_root:
-        print(f"Data Root: {args.data_root}")
-    print(f"Train Dir: {args.train_dir}")
-    print(f"Val Dir:   {args.val_dir}")
-    print(f"Patch Size: {args.patch_size}, Batch Size: {args.batch_size}")
-    print(f"Epochs: {args.num_epochs}, Learning Rate: {args.learning_rate}")
-    print(f"Device: {device}")
-    print(f"Checkpoint prefix: {args.checkpoint_prefix}")
-    print(f"Drive ckpt dir:    {args.drive_checkpoint_dir}")
-    print(f"Max train images:  {args.max_train_images}")
-    print(f"Max val images:    {args.max_val_images}")
-    print(f"Force train:       {args.force_train}")
-    print("-----------------------------------\n")
+    print("\n--- [Config] Training Configuration ---")
+    print(f"Variant:       {args.model_variant}")
+    print(f"Data Root:     {args.data_root}")
+    print(f"Batch Size:    {args.batch_size}")
+    print(f"Epochs:        {args.num_epochs}")
+    print(f"Learning Rate: {args.learning_rate}")
+    print(f"Device:        {device}")
+    print(f"Drive Output:  {args.drive_checkpoint_dir}")
+    print("---------------------------------------\n")
 
-    # File naming based on prefix
+    # Define Checkpoint Paths
     ckpt_latest_local = f"{args.checkpoint_prefix}_latest.pth"
     ckpt_final_local  = f"{args.checkpoint_prefix}_final.pth"
     ckpt_latest_drive = os.path.join(args.drive_checkpoint_dir, f"{args.checkpoint_prefix}_latest.pth")
@@ -279,61 +267,67 @@ def main():
     loss_plot_local = f"{args.checkpoint_prefix}_loss_curves.png"
     loss_plot_drive = os.path.join(args.drive_checkpoint_dir, f"{args.checkpoint_prefix}_loss_curves.png")
 
-    # Data
+    # Initialize Data
     train_loader, val_loader = build_dataloaders(args, device)
 
-    # Model
-    print("--- [train_teacher] Initializing model...")
-    model = FrequencyAwareTeacher(
-        in_channels=4,
-        out_channels=4,
-        img_size=args.patch_size
-    ).to(device)
+    # Initialize Model
+    print(f"--- [Model] Initializing {args.model_variant} model...")
+    # Both variants use the same class structure now, but we keep the alias for clarity/compatibility
+    if args.model_variant == "v2":
+        model = FrequencyAwareTeacherV2(
+            in_channels=4, out_channels=4, img_size=args.patch_size
+        ).to(device)
+    else:
+        model = FrequencyAwareTeacher(
+            in_channels=4, out_channels=4, img_size=args.patch_size
+        ).to(device)
 
+    # Resume Training
     if not args.force_train:
         candidate_ckpts = [
-            ckpt_final_drive,
-            ckpt_final_local,
+            ckpt_final_drive, ckpt_final_local,
             ckpt_best_drive,
-            ckpt_latest_drive,
-            ckpt_latest_local,
+            ckpt_latest_drive, ckpt_latest_local,
         ]
-        load_existing_checkpoint(model, candidate_ckpts, device, "train_teacher")
+        load_existing_checkpoint(model, candidate_ckpts, device, "Teacher")
 
-    # Losses
-    print("--- [train_teacher] Initializing losses...")
+    # Initialize Losses
+    print(f"--- [Loss] Initializing losses for {args.model_variant}...")
     pixel_loss_fn = CharbonnierLoss().to(device)
     perceptual_loss_fn = lpips.LPIPS(net='vgg').to(device)
-    fft_loss_fn = FFTAmplitudeLoss(
-        loss_weight=1.0,
-        focus_low_freq=True,
-        cutoff=0.25
-    ).to(device)
+    
+    if args.model_variant == "v2":
+        fft_loss_fn = FFTAmpPhaseMultiScaleLoss(
+            loss_weight=1.0, focus_low_freq=True, cutoff=0.25,
+            lambda_amp=1.0, lambda_phase=0.5, scales=(1.0, 0.5)
+        ).to(device)
+    else:
+        fft_loss_fn = FFTAmplitudeLoss(
+            loss_weight=1.0, focus_low_freq=True, cutoff=0.25
+        ).to(device)
 
-    # Loss weights (same as earlier)
+    # Loss Weights
     W_PIXEL = 1.0
     W_PERCEPTUAL = 0.1
     W_FFT = 0.05
 
-    # Optimizer, scheduler, AMP
+    # Optimization
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.num_epochs
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     scaler = GradScaler()
 
-    # Histories
+    # Training Loop
     train_loss_history = []
     val_loss_history = []
     best_val_loss = float("inf")
 
-    print("--- [train_teacher] Starting training...")
+    print("--- [Train] Starting training loop...")
 
     for epoch in range(args.num_epochs):
         model.train()
         running_train_loss = 0.0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} [train]")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} [Train]")
         for udc_batch, gt_batch in pbar:
             udc_batch = udc_batch.to(device, non_blocking=True)
             gt_batch  = gt_batch.to(device,  non_blocking=True)
@@ -367,13 +361,12 @@ def main():
             pbar.set_postfix({"loss": f"{total_loss.item():.4f}"})
 
         avg_train_loss = running_train_loss / len(train_loader)
-        print(f"--- [train_teacher] Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
-
+        
         # Validation
         model.eval()
         running_val_loss = 0.0
         with torch.no_grad():
-            pbar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} [val]")
+            pbar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} [Val]")
             for udc_batch, gt_batch in pbar_val:
                 udc_batch = udc_batch.to(device, non_blocking=True)
                 gt_batch  = gt_batch.to(device,  non_blocking=True)
@@ -386,26 +379,24 @@ def main():
                 pbar_val.set_postfix({"val_loss": f"{loss_val.item():.4f}"})
 
         avg_val_loss = running_val_loss / len(val_loader)
-        print(f"--- [train_teacher] Epoch {epoch+1} Val Charbonnier Loss: {avg_val_loss:.4f}")
+        print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
         scheduler.step()
 
-        # Record histories
+        # Update History
         train_loss_history.append(avg_train_loss)
         val_loss_history.append(avg_val_loss)
 
-        # Save latest checkpoint (local + drive)
+        # Checkpointing
         torch.save(model.state_dict(), ckpt_latest_local)
         torch.save(model.state_dict(), ckpt_latest_drive)
-        print(f"Saved latest teacher checkpoint to {ckpt_latest_local} and {ckpt_latest_drive}")
 
-        # Save best checkpoint
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), ckpt_best_drive)
-            print(f"New best val loss. Saved best teacher checkpoint to {ckpt_best_drive}")
+            print(f"New best validation loss! Saved to {ckpt_best_drive}")
 
-        # Save loss history every epoch
+        # Save History Artifacts
         if args.save_loss_history:
             np.savez(
                 loss_hist_local,
@@ -418,33 +409,32 @@ def main():
                 val_loss=np.array(val_loss_history,   dtype=np.float32),
             )
 
-    # Final named checkpoint
+    # Final Save
     torch.save(model.state_dict(), ckpt_final_local)
     torch.save(model.state_dict(), ckpt_final_drive)
-    print(f"--- [train_teacher] Final model saved as {ckpt_final_local} locally and on Drive")
+    print(f"--- [Train] Completed. Final model saved to {ckpt_final_drive}")
 
-    # Final loss curves plot
+    # Plotting
     if args.save_loss_history:
         epochs = np.arange(1, len(train_loss_history) + 1)
         fig, ax = plt.subplots(figsize=(7, 5))
         ax.plot(epochs, train_loss_history, label="Train")
         ax.plot(epochs, val_loss_history,   label="Val")
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("Loss (Charbonnier + FFT + LPIPS)")
-        ax.set_title("Teacher Training & Validation Loss")
+        ax.set_ylabel("Loss")
+        ax.set_title("Training & Validation Loss")
         ax.grid(True)
         ax.legend()
         fig.tight_layout()
         fig.savefig(loss_plot_local, dpi=150)
         plt.close(fig)
 
-        # Copy plot to Drive
         try:
             import shutil
             shutil.copy(loss_plot_local, loss_plot_drive)
-            print(f"Saved loss curves plot to {loss_plot_local} and {loss_plot_drive}")
+            print(f"Saved loss plot to {loss_plot_drive}")
         except Exception as e:
-            print(f"Could not copy loss plot to Drive: {e}")
+            print(f"Warning: Could not copy plot to Drive: {e}")
 
 
 if __name__ == "__main__":

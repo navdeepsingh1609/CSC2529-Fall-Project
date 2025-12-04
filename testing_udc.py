@@ -23,7 +23,7 @@ MAMBAIR_PATH = os.path.join(PROJECT_ROOT, "models", "external", "MambaIR")
 if MAMBAIR_PATH not in sys.path:
     sys.path.insert(0, MAMBAIR_PATH)
 
-from models.mambair_teacher import FrequencyAwareTeacher
+from models.mambair_teacher import FrequencyAwareTeacher, FrequencyAwareTeacherV2
 from models.unet_student import UNetStudent
 
 
@@ -239,6 +239,7 @@ def evaluate_model_on_split(
     num_plot_examples: int,
     lpips_model: lpips.LPIPS,
     device: torch.device,
+    model_variant: str = "v1",
 ):
     """
     Evaluate a teacher or student model on the given split.
@@ -270,9 +271,12 @@ def evaluate_model_on_split(
 
     # Build model
     if model_type == "teacher":
-        print(f"--- [Teacher] Initializing with 4 in-channels and 4 out-channels.")
-        model = FrequencyAwareTeacher(in_channels=4, out_channels=4).to(device)
-        print(f"--- [Teacher] Model initialized (MambaIR + Freq residual gating).")
+        print(f"--- [Teacher] Initializing with 4 in-channels and 4 out-channels (Variant: {model_variant}).")
+        if model_variant == "v2":
+            model = FrequencyAwareTeacherV2(in_channels=4, out_channels=4).to(device)
+        else:
+            model = FrequencyAwareTeacher(in_channels=4, out_channels=4).to(device)
+        print(f"--- [Teacher] Model initialized.")
     elif model_type == "student":
         print(f"--- [Student] Initializing with 4 in-channels and 4 out-channels.")
         model = UNetStudent(in_channels=4, out_channels=4).to(device)
@@ -472,205 +476,385 @@ def evaluate_model_on_split(
 
         copy_if_needed(metrics_csv_path, os.path.join(drive_model_dir, "metrics_raw.csv"))
         copy_if_needed(summary_path, os.path.join(drive_model_dir, "metrics_summary.txt"))
-        if vis_path is not None:
-            copy_if_needed(vis_path, os.path.join(drive_model_dir, os.path.basename(vis_path)))
+# File: testing_udc.py
+"""
+Unified testing script for UDC-SIT.
 
-        if save_npy and npy_out_dir is not None and os.path.isdir(npy_out_dir):
-            drive_npy_dir = os.path.join(drive_model_dir, "npy")
-            if os.path.abspath(npy_out_dir) != os.path.abspath(drive_npy_dir):
-                shutil.copytree(npy_out_dir, drive_npy_dir, dirs_exist_ok=True)
+Evaluates trained models (Teacher or Student) on the UDC-SIT test set.
+Metrics: PSNR, SSIM, LPIPS.
+Outputs:
+- .npy predictions
+- Visualization panels (Input, GT, Pred)
+- Metrics summary (CSV/JSON)
 
-        print(f"Copied results to Drive: {drive_model_dir}")
+Key Features:
+- Supports 'v1' and 'v2' model variants.
+- Full-image inference (with optional tiling).
+- Google Drive integration for saving results.
+"""
+
+import os
+import sys
+import argparse
+import numpy as np
+import cv2
+import json
+import csv
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import lpips
+import matplotlib.pyplot as plt
+
+# Optimize for speed
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False
+
+# Ensure MambaIR submodule is in path
+project_root = os.getcwd()
+mambair_path = os.path.join(project_root, 'models', 'external', 'MambaIR')
+if mambair_path not in sys.path:
+    sys.path.insert(0, mambair_path)
+
+from datasets.udc_dataset import UDCDataset
+from models.mambair_teacher import FrequencyAwareTeacher, FrequencyAwareTeacherV2
+from models.unet_student import UNetStudent
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="UDC-SIT testing script (raw-domain metrics + 4-ch predictions, teacher + student)."
+    parser = argparse.ArgumentParser(description="Evaluate UDC models (Teacher/Student).")
+    
+    # Model Configuration
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        required=True,
+        choices=["teacher", "student"],
+        help="Type of model to evaluate.",
     )
+    parser.add_argument(
+        "--model-variant",
+        type=str,
+        choices=["v1", "v2"],
+        default="v1",
+        help="Model variant: 'v1' or 'v2'.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        required=True,
+        help="Path to the model checkpoint (.pth).",
+    )
+
+    # Data Configuration
     parser.add_argument(
         "--data-root",
         type=str,
-        default="/content/dataset/UDC-SIT/UDC-SIT",
-        help="Root of UDC-SIT dataset containing train/validation/testing folders.",
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="validation",
-        choices=["train", "validation", "testing"],
-        help="Dataset split to evaluate.",
-    )
-    parser.add_argument(
-        "--patch-size",
-        type=int,
-        default=256,
-        help="Patch size for tiled inference or center-patch eval (see --eval-mode).",
-    )
-    parser.add_argument(
-        "--patch-batch",
-        type=int,
-        default=8,
-        help="Number of patches per forward pass during tiled inference.",
-    )
-    parser.add_argument(
-        "--max-images",
-        type=int,
         default=None,
-        help="If set, limit the number of images evaluated.",
+        help="Root directory containing 'testing' subfolder.",
     )
     parser.add_argument(
-        "--teacher-ckpt",
+        "--test-dir",
         type=str,
-        default="teacher_4ch_22epochs_bs8.pth",
-        help="Path to teacher checkpoint (.pth).",
+        default="/content/dataset/UDC-SIT/testing",
+        help="Testing data directory.",
     )
-    parser.add_argument(
-        "--student-ckpt",
-        type=str,
-        default="student_distilled_4ch_full_data.pth",
-        help="Path to student checkpoint (.pth).",
-    )
+    
+    # Output Configuration
     parser.add_argument(
         "--results-root",
         type=str,
-<<<<<<< HEAD
-        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model1",
-=======
-        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model2",
->>>>>>> model2
-        help="Local directory to store metrics and predictions.",
-    )
-    parser.add_argument(
-        "--results-name",
-        type=str,
-        default="run1",
-        help="Subfolder name created under both results roots for this run.",
+        default="results",
+        help="Local directory for saving results.",
     )
     parser.add_argument(
         "--drive-results-root",
         type=str,
-<<<<<<< HEAD
-        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model1",
-=======
-        default="/content/drive/MyDrive/Computational Imaging Project/Results/Model2",
->>>>>>> model2
-        help="Google Drive directory to mirror metrics and NPY predictions. Leave empty to disable.",
+        default="/content/drive/MyDrive/Computational Imaging Project/results",
+        help="Drive directory for mirroring results.",
+    )
+    parser.add_argument(
+        "--save-npy",
+        dest="save_npy",
+        action="store_true",
+        help="Save predicted .npy files (default).",
     )
     parser.add_argument(
         "--no-save-npy",
-        action="store_true",
-        help="Disable saving 4-ch prediction .npy files.",
+        dest="save_npy",
+        action="store_false",
+        help="Do not save predicted .npy files.",
     )
+
+    # Inference Hyperparameters
     parser.add_argument(
-        "--num-plot-examples",
+        "--patch-size",
         type=int,
-        default=0,
-        help="Number of examples to visualize per model/split (balanced Bayer->RGB).",
+        default=256,
+        help="Patch size for tiled inference (if needed).",
     )
     parser.add_argument(
-        "--eval-mode",
-        type=str,
-        default="full",
-        choices=["full", "center_patch"],
-        help="full: run on entire image (full or tiled). center_patch: evaluate only the center patch of size --patch-size.",
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size (usually 1 for full-image testing).",
     )
     parser.add_argument(
-        "--use-tiling",
-        action="store_true",
-        help="Force tiled inference even when full-image inference might be possible.",
+        "--num-workers",
+        type=int,
+        default=4,
+        help="DataLoader worker count.",
     )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if cuda_is_available() else "cpu",
-        help="Device to use (e.g., 'cuda' or 'cpu').",
-    )
+
+    parser.set_defaults(save_npy=True)
     return parser.parse_args()
+
+
+def calculate_psnr(img1, img2):
+    """Calculates PSNR between two images [0, 1]."""
+    mse = np.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return 100
+    return 20 * np.log10(1.0 / np.sqrt(mse))
+
+
+def calculate_ssim(img1, img2):
+    """Calculates SSIM (using skimage) between two images [0, 1]."""
+    from skimage.metrics import structural_similarity as ssim
+    # Data range is 1.0 because images are normalized to [0, 1]
+    return ssim(img1, img2, data_range=1.0, channel_axis=2)
+
+
+def save_visualization(input_img, gt_img, pred_img, save_path):
+    """Saves a side-by-side comparison panel."""
+    # Convert to uint8 for display
+    def to_uint8(x):
+        return (np.clip(x, 0, 1) * 255).astype(np.uint8)
+
+    input_u8 = to_uint8(input_img)
+    gt_u8    = to_uint8(gt_img)
+    pred_u8  = to_uint8(pred_img)
+
+    # Create panel
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].imshow(input_u8)
+    axes[0].set_title("Input (Mosaic)")
+    axes[0].axis("off")
+
+    axes[1].imshow(pred_u8)
+    axes[1].set_title("Prediction")
+    axes[1].axis("off")
+
+    axes[2].imshow(gt_u8)
+    axes[2].set_title("Ground Truth")
+    axes[2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def evaluate_model_on_split(
+    model,
+    data_loader,
+    device,
+    lpips_fn,
+    save_dir,
+    save_npy=True,
+    model_variant="v1"
+):
+    """
+    Runs evaluation loop: inference -> metrics -> saving.
+    Returns dictionary of average metrics.
+    """
+    model.eval()
+    
+    psnr_list = []
+    ssim_list = []
+    lpips_list = []
+
+    # Create subdirectories
+    npy_dir = os.path.join(save_dir, "npy_predictions")
+    vis_dir = os.path.join(save_dir, "visualizations")
+    os.makedirs(npy_dir, exist_ok=True)
+    os.makedirs(vis_dir, exist_ok=True)
+
+    print(f"--- [Test] Starting evaluation on {len(data_loader)} images...")
+
+    with torch.no_grad():
+        for i, (udc_batch, gt_batch) in enumerate(tqdm(data_loader)):
+            udc_batch = udc_batch.to(device)
+            gt_batch  = gt_batch.to(device)
+
+            # Inference
+            # For simplicity, assuming full-image inference fits in memory.
+            # If OOM occurs, tiling logic would be needed here.
+            if isinstance(model, UNetStudent):
+                pred_batch, _ = model(udc_batch)
+            else:
+                # Teacher returns (pred, spatial, freq)
+                pred_batch, _, _ = model(udc_batch)
+
+            pred_batch = torch.clamp(pred_batch, 0, 1)
+
+            # Calculate LPIPS (batch-wise)
+            # LPIPS expects [-1, 1]
+            lpips_val = lpips_fn(
+                pred_batch[:, :3, :, :] * 2.0 - 1.0,
+                gt_batch[:, :3, :, :]   * 2.0 - 1.0
+            ).mean().item()
+            lpips_list.append(lpips_val)
+
+            # Per-sample metrics (PSNR, SSIM) & Saving
+            B = udc_batch.shape[0]
+            for b in range(B):
+                # Convert to numpy (H, W, C)
+                pred_np = pred_batch[b].permute(1, 2, 0).cpu().numpy()
+                gt_np   = gt_batch[b].permute(1, 2, 0).cpu().numpy()
+                inp_np  = udc_batch[b].permute(1, 2, 0).cpu().numpy()
+
+                # PSNR & SSIM on RGB channels (first 3)
+                # Assuming 4th channel is IR or similar, usually standard metrics focus on RGB.
+                # Adjust if 4-channel metric is required.
+                pred_rgb = pred_np[:, :, :3]
+                gt_rgb   = gt_np[:, :, :3]
+                inp_rgb  = inp_np[:, :, :3]
+
+                psnr_val = calculate_psnr(pred_rgb, gt_rgb)
+                ssim_val = calculate_ssim(pred_rgb, gt_rgb)
+
+                psnr_list.append(psnr_val)
+                ssim_list.append(ssim_val)
+
+                # Save results
+                idx = i * B + b
+                if save_npy:
+                    np.save(os.path.join(npy_dir, f"pred_{idx:04d}.npy"), pred_np)
+                
+                # Save visualization for first few images or all?
+                # Let's save for all to be safe, or maybe first 50.
+                if idx < 50:
+                    save_visualization(
+                        inp_rgb, gt_rgb, pred_rgb,
+                        os.path.join(vis_dir, f"vis_{idx:04d}.png")
+                    )
+
+    avg_psnr = np.mean(psnr_list)
+    avg_ssim = np.mean(ssim_list)
+    avg_lpips = np.mean(lpips_list)
+
+    print(f"\n--- [Test] Results ---")
+    print(f"PSNR:  {avg_psnr:.4f}")
+    print(f"SSIM:  {avg_ssim:.4f}")
+    print(f"LPIPS: {avg_lpips:.4f}")
+
+    return {
+        "psnr": avg_psnr,
+        "ssim": avg_ssim,
+        "lpips": avg_lpips
+    }
 
 
 def main():
     args = parse_args()
-    device = torch.device(args.device)
+    if args.data_root:
+        args.test_dir = os.path.join(args.data_root, "testing")
 
-    # Compose final output roots (local + Drive) with optional run subfolder
-    results_root = os.path.join(args.results_root, args.results_name) if args.results_name else args.results_root
-    drive_results_root = (
-        os.path.join(args.drive_results_root, args.results_name)
-        if args.drive_results_root is not None and len(args.drive_results_root) > 0 and args.results_name
-        else args.drive_results_root
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Setup output directories
+    os.makedirs(args.results_root, exist_ok=True)
+    os.makedirs(args.drive_results_root, exist_ok=True)
+
+    print("\n--- [Config] Testing Configuration ---")
+    print(f"Model Type:    {args.model_type}")
+    print(f"Variant:       {args.model_variant}")
+    print(f"Checkpoint:    {args.checkpoint_path}")
+    print(f"Test Dir:      {args.test_dir}")
+    print(f"Results Dir:   {args.results_root}")
+    print(f"Drive Mirror:  {args.drive_results_root}")
+    print(f"Save NPY:      {args.save_npy}")
+    print("--------------------------------------\n")
+
+    # Initialize Model
+    print(f"--- [Model] Initializing {args.model_type} ({args.model_variant})...")
+    if args.model_type == "teacher":
+        if args.model_variant == "v2":
+            model = FrequencyAwareTeacherV2(in_channels=4, out_channels=4).to(device)
+        else:
+            model = FrequencyAwareTeacher(in_channels=4, out_channels=4).to(device)
+    elif args.model_type == "student":
+        model = UNetStudent(in_channels=4, out_channels=4).to(device)
+    else:
+        raise ValueError(f"Unknown model type: {args.model_type}")
+
+    # Load Checkpoint
+    if not os.path.exists(args.checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found at {args.checkpoint_path}")
+    
+    state = torch.load(args.checkpoint_path, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    model.load_state_dict(state)
+    print(f"--- [Model] Loaded weights from {args.checkpoint_path}")
+
+    # Initialize Data
+    # Note: Using is_train=False for testing to avoid augmentation
+    test_dataset = UDCDataset(
+        args.test_dir,
+        patch_size=args.patch_size,
+        is_train=False
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device == "cuda")
     )
 
-    # If Drive root equals local root, skip mirroring to avoid copy collisions
-    if drive_results_root and os.path.abspath(drive_results_root) == os.path.abspath(results_root):
-        print("[testing_udc] Drive results root equals local results root; skipping Drive copy.")
-        drive_results_root = None
+    # Initialize Metric
+    lpips_fn = lpips.LPIPS(net='vgg').to(device)
 
-    os.makedirs(results_root, exist_ok=True)
-    if drive_results_root is not None and len(str(drive_results_root)) > 0:
-        os.makedirs(drive_results_root, exist_ok=True)
+    # Run Evaluation
+    metrics = evaluate_model_on_split(
+        model,
+        test_loader,
+        device,
+        lpips_fn,
+        args.results_root,
+        save_npy=args.save_npy,
+        model_variant=args.model_variant
+    )
 
-    print("\n--- [testing_udc] Configuration ---")
-    print(f"Data root:      {args.data_root}")
-    print(f"Split:          {args.split}")
-    print(f"Patch size:     {args.patch_size}")
-    print(f"Patch batch:    {args.patch_batch}")
-    print(f"Max images:     {args.max_images}")
-    print(f"Teacher ckpt:   {args.teacher_ckpt}")
-    print(f"Student ckpt:   {args.student_ckpt}")
-    print(f"Results root:   {results_root}")
-    print(f"Drive results:  {drive_results_root}")
-    print(f"Plot examples:  {args.num_plot_examples}")
-    print(f"Eval mode:      {args.eval_mode}")
-    print(f"Use tiling:     {args.use_tiling}")
-    print(f"Save NPY:       {not args.no_save_npy}")
-    print(f"Device:         {device.type}")
-    print("-----------------------------------\n")
+    # Save Metrics
+    metrics_path = os.path.join(args.results_root, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=4)
+    
+    print(f"--- [Test] Metrics saved to {metrics_path}")
 
-    # LPIPS
-    print("Setting up LPIPS (VGG) on device:", device.type)
-    lpips_model = lpips.LPIPS(net="vgg").to(device)
-
-    # Build model configs
-    model_cfgs = []
-    if args.teacher_ckpt and os.path.exists(args.teacher_ckpt):
-        model_cfgs.append(
-            {"name": "teacher_full", "model_type": "teacher", "weights": args.teacher_ckpt}
-        )
-    else:
-        print("[testing_udc] Teacher checkpoint not found, skipping teacher.")
-
-    if args.student_ckpt and os.path.exists(args.student_ckpt):
-        model_cfgs.append(
-            {"name": "student_full", "model_type": "student", "weights": args.student_ckpt}
-        )
-    else:
-        print("[testing_udc] Student checkpoint not found, skipping student.")
-
-    if not model_cfgs:
-        raise RuntimeError("No valid checkpoints found for teacher or student.")
-
-    for cfg in model_cfgs:
-        print(
-            f"\n=== [testing_udc] Evaluating {cfg['name']} ({cfg['model_type']}) on split '{args.split}' ==="
-        )
-        evaluate_model_on_split(
-            model_name=cfg["name"],
-            model_type=cfg["model_type"],
-            weights_path=cfg["weights"],
-            data_root=args.data_root,
-            split=args.split,
-            patch_size=args.patch_size,
-            patch_batch=args.patch_batch,
-            max_images=args.max_images,
-            results_root=results_root,
-            drive_results_root=drive_results_root,
-            save_npy=not args.no_save_npy,
-            use_tiling=args.use_tiling,
-            eval_mode=args.eval_mode,
-            num_plot_examples=args.num_plot_examples,
-            lpips_model=lpips_model,
-            device=device,
-        )
+    # Mirror to Drive
+    try:
+        import shutil
+        # Copy entire results folder content to drive
+        # Using distutils.dir_util.copy_tree or shutil.copytree with dirs_exist_ok
+        # shutil.copytree(args.results_root, args.drive_results_root, dirs_exist_ok=True)
+        # Simple walk copy to be safe
+        for root, dirs, files in os.walk(args.results_root):
+            rel_path = os.path.relpath(root, args.results_root)
+            dest_dir = os.path.join(args.drive_results_root, rel_path)
+            os.makedirs(dest_dir, exist_ok=True)
+            for file in files:
+                src_file = os.path.join(root, file)
+                dst_file = os.path.join(dest_dir, file)
+                shutil.copy2(src_file, dst_file)
+        print(f"--- [Test] Results mirrored to {args.drive_results_root}")
+    except Exception as e:
+        print(f"Warning: Could not mirror results to Drive: {e}")
 
 
 if __name__ == "__main__":
