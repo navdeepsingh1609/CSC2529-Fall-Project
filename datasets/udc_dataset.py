@@ -1,4 +1,13 @@
-# File: datasets/udc_dataset.py
+"""
+UDC-SIT Dataset Loader.
+
+Handles loading and preprocessing of the UDC-SIT dataset (Numpy format).
+Supports:
+- Loading Input/GT pairs for Training, Validation, and Testing.
+- On-the-fly random cropping and augmentation (flip/rotation).
+- Normalization (14-bit to [0,1]).
+"""
+
 import os
 import glob
 import numpy as np
@@ -7,17 +16,34 @@ from torch.utils.data import Dataset
 import random
 
 class UDCDataset(Dataset):
-    def __init__(self, data_dir, patch_size=256, is_train=True):
+    """
+    PyTorch Dataset for UDC-SIT (Under-Display Camera) data.
+    
+    Expects data structure:
+        root/
+            split/ (training/validation/testing)
+                input/ (containing .npy files)
+                GT/    (containing .npy files)
+    
+    Args:
+        root_dir (str): Root directory of the dataset.
+        split (str): 'training', 'validation', or 'testing'.
+        patch_size (int): Size of random crops for training (default: 256).
+        is_train (bool): Enable data augmentation (default: True).
+    """
+    def __init__(self, root_dir, split='training', patch_size=256, is_train=True):
         self.patch_size = patch_size
         self.is_train = is_train
+        self.root_dir = root_dir
+        self.split = split
         
-        # Expect files under data_dir/input/*.npy
-        self.input_files = sorted(glob.glob(os.path.join(data_dir, "input", "*.npy")))
+        # Expect files under root_dir/split/input/*.npy
+        data_path = os.path.join(self.root_dir, self.split, "input")
+        self.input_files = sorted(glob.glob(os.path.join(data_path, "*.npy")))
         
         if not self.input_files:
-            raise FileNotFoundError(f"No .npy files found in {os.path.join(data_dir, 'input')}")
+            raise FileNotFoundError(f"No .npy files found in {data_path}")
         
-        print(f"--- [UDCDataset] Loaded {len(self.input_files)} files from {data_dir}")
 
     def __len__(self):
         return len(self.input_files)

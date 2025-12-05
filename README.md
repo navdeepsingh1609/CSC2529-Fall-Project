@@ -1,66 +1,97 @@
-# UDC-SIT: Under-Display Camera Image Restoration
+# Frequency-Aware Image Restoration for Under-Display Cameras
 
-This repository contains the implementation for UDC image restoration using a Frequency-Aware Teacher-Student framework.
+A comprehensive PyTorch framework for restoring images captured by Under-Display Cameras (UDC), leveraging **Frequency-Aware Knowledge Distillation** and **MambaIR v2**.
+
+## Overview
+
+Under-Display Camera (UDC) technology enables full-screen displays but introduces severe image degradation due to diffraction and low light transmission through the organic LED panel. This project addresses these challenges with a progressive two-stage distillation framework:
+
+1.  **Frequency-Aware Teacher**: A high-capacity model (MambaIR v2 + Frequency Branch) trained on full-resolution images to learn global degradation patterns.
+2.  **Lightweight Student**: A U-Net student distilled from the teacher using multi-domain losses (Spatial, Frequency, and Perceptual).
 
 ## Key Features
-- **Unified Workflow**: Single set of scripts for both Model 1 (Amplitude Loss) and Model 2 (Amplitude + Phase Loss).
-- **Frequency-Aware Teacher**: Combines MambaIR spatial backbone with a Frequency Domain Block.
-- **Knowledge Distillation**: Lightweight UNet Student distilled from the Teacher.
-- **Google Drive Integration**: Seamless saving of checkpoints and results to Drive.
+
+*   **Dual-Domain Processing**: Explicitly handles diffraction artifacts in both spatial and frequency domains.
+*   **MambaIR v2 Integration**: Utilizes State-Space Models (SSM) with Attentive State-Space Modules (ASSM) for efficient long-range dependency modeling.
+*   **Knowledge Distillation**: Compresses the heavy teacher model into a lightweight student suitable for mobile deployment.
+*   **Progressive Variants**:
+    *   **Method 1 (Baseline)**: Spectral Amplitude Distillation.
+    *   **Method 2 (Proposed)**: Multi-Scale Phase-Aware Distillation with Gated Fusion.
 
 ## Repository Structure
+
 ```
-.
-├── datasets/           # Data loading logic (UDCDataset)
-├── losses/             # Loss functions (Charbonnier, Frequency, LPIPS)
-├── models/             # Model definitions (Teacher, Student, MambaIR)
-├── scripts/            # Utility scripts (e.g., subset creation)
-├── train_teacher.py    # Main teacher training script
-├── train_student_kd.py # Main student KD training script
-├── testing_udc.py      # Unified evaluation script
-└── Unified_Training_Testing.ipynb # Colab notebook for end-to-end runs
+├── models/
+│   ├── basic_block.py       # Basic building blocks (Conv, ResBlock)
+│   ├── frequency_block.py   # Frequency Domain Processing Blocks
+│   ├── mambair_teacher.py   # Teacher: MambaIR v2 + Frequency Branch
+│   └── unet_student.py      # Student: U-Net + KD Heads
+├── losses/
+│   ├── frequency_loss.py    # Amplitude and Phase-Aware FFT Losses
+│   └── pixel_loss.py        # Charbonnier Loss
+├── datasets/
+│   └── udc_dataset.py       # UDC-SIT Dataset Loader (Numpy format)
+├── train_teacher.py         # Teacher training script
+├── train_student_kd.py      # Student distillation script
+├── testing_udc.py           # Evaluation script (Full-Res & Tiled)
+└── Unified_Training_Testing.ipynb # Complete Colab Workflow
 ```
 
-## Usage
+## Quick Start
 
-### 1. Training the Teacher
-Use `train_teacher.py` with `--model-variant` to select the configuration.
+### 1. Installation
 
-**Model 1 (Amplitude Loss):**
 ```bash
-python train_teacher.py --model-variant v1 --preset full
+pip install -r requirements.txt
+pip install timm mamba-ssm causal-conv1d
 ```
 
-**Model 2 (Multi-Scale Phase Loss):**
+### 2. Training
+
+**Train the Teacher (Stage 1):**
 ```bash
-python train_teacher.py --model-variant v2 --preset full
+python train_teacher.py \
+    --model-variant v2 \
+    --data-root ./dataset/UDC-SIT \
+    --batch-size 8 \
+    --num-epochs 22
 ```
 
-### 2. Training the Student (Knowledge Distillation)
-First, ensure you have a trained teacher checkpoint.
-
-**Distill from Model 1 Teacher:**
+**Train the Student (Stage 2 - Distillation):**
 ```bash
-python train_student_kd.py --model-variant v1 --teacher-weights path/to/teacher_v1.pth --preset full
-```
-
-**Distill from Model 2 Teacher:**
-```bash
-python train_student_kd.py --model-variant v2 --teacher-weights path/to/teacher_v2.pth --preset full
+python train_student_kd.py \
+    --model-variant v2 \
+    --teacher-weights checkpoints/teacher_v2_final.pth \
+    --data-root ./dataset/UDC-SIT \
+    --batch-size 64
 ```
 
 ### 3. Evaluation
-Use `testing_udc.py` to evaluate either model.
+
+Evaluate the trained student model using either full-resolution inference or patch-based tiling:
 
 ```bash
 python testing_udc.py \
     --model-type student \
-    --checkpoint-path path/to/student.pth \
-    --test-dir /path/to/test/data
+    --checkpoint-path checkpoints/student_kd_final.pth \
+    --data-root ./dataset/UDC-SIT/testing \
+    --eval-mode full  # or 'tiled' for memory efficiency
 ```
 
-## Google Colab
-The `Unified_Training_Testing.ipynb` notebook provides a complete environment setup and execution flow for Google Colab, including:
-- Dataset extraction from Drive.
-- Dependency installation.
-- Training and Evaluation commands.
+## Method Comparison
+
+| Feature | Method 1 (Baseline) | Method 2 (Proposed) |
+| :--- | :--- | :--- |
+| **Fusion Mechanism** | Direct Concatenation | Gated Fusion (Spatial-guided) |
+| **Frequency Loss** | Amplitude Only (L1) | Multi-Scale Amplitude + Phase |
+| **Student Architecture** | Standard U-Net | U-Net + High-Res Skip Frequency Block |
+
+## Methodology
+
+For a detailed mathematical formulation of the loss functions and architectural decisions, please refer to `Methodology.docx` or `methodology.tex`.
+
+## Acknowledgements
+
+This project builds upon:
+*   **MambaIR**: "A Simple Baseline for Image Restoration with State-Space Model"
+*   **LPIPS**: "The Unreasonable Effectiveness of Deep Features as a Perceptual Metric"

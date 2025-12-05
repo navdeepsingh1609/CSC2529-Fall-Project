@@ -1,18 +1,17 @@
-# File: train_student_kd.py
 """
-Unified Knowledge Distillation (KD) training script for UDC-SIT.
+Unified Knowledge Distillation (KD) Training Script for UDC-SIT.
 
-Trains the UNetStudent model using a pre-trained FrequencyAwareTeacher.
-Distillation Objectives:
-- Pixel Loss (Charbonnier)
-- Feature Loss (Spatial + Frequency)
-- Perceptual Loss (LPIPS)
+Trains the lightweight UNetStudent model by distilling knowledge from a frozen 
+Frequency-Aware Teacher. Implements a multi-objective loss function including:
+- Reconstruction: Charbonnier Loss (Spatial)
+- Distillation: Feature Matching (Spatial + Frequency) and Output Matching
+- Perceptual: LPIPS Loss
 
-Key Features:
-- Supports both 'v1' and 'v2' teacher variants.
-- Freezes teacher weights during training.
-- Mixed-precision training (AMP).
-- Google Drive integration.
+Supports both 'v1' and 'v2' distillation strategies involving different
+frequency loss components (Amplitude vs. Amplitude+Phase).
+
+Usage:
+    python train_student_kd.py --model-variant v2 --teacher-weights path/to/teacher.pth
 """
 
 import os
@@ -306,7 +305,12 @@ def main():
 
     # Initialize Student
     print("--- [Model] Initializing Student...")
-    student = UNetStudent(in_channels=4, out_channels=4).to(device)
+    enable_skip_freq = (args.model_variant == "v2")
+    student = UNetStudent(
+        in_channels=4, 
+        out_channels=4, 
+        enable_skip_freq=enable_skip_freq
+    ).to(device)
     
     if not args.force_train:
         candidate_ckpts = [

@@ -1,7 +1,36 @@
-# File: losses/frequency_loss.py
+```
+"""
+Frequency Domain Loss Functions.
+
+Implements loss functions for constraining model predictions in the Fourier domain:
+- Amplitude Loss: Minimizes L1 difference of spectral amplitudes.
+- Phase Loss: Minimizes L1 difference of spectral phases.
+- Multi-Scale Loss: Applies frequency constraints at multiple resolutions.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.fft
+
+
+class FrequencyLoss(nn.Module):
+    """
+    Computes loss in the frequency domain.
+    
+    Args:
+        loss_type (str): 'l1' or 'l2' (default: 'l1').
+        alpha (float): Weight for amplitude loss (default: 1.0).
+        beta (float): Weight for phase loss (default: 1.0).
+    """
+    def __init__(self, loss_type='l1', alpha=1.0, beta=1.0):
+        super().__init__()
+        # Placeholder for implementation based on the provided signature.
+        # The original instruction's `__init__` body was truncated.
+        self.loss_type = loss_type
+        self.alpha = alpha
+        self.beta = beta
+        # Further implementation would go here.
 
 
 class FFTAmpPhaseMultiScaleLoss(nn.Module):

@@ -1,4 +1,17 @@
 # File: testing_udc.py
+"""
+Unified Evaluation Script for UDC Image Restoration.
+
+Performs evaluation of trained Teacher or Student models on the UDC-SIT test set.
+Supports:
+- Full-Resolution Inference.
+- Tiled (Patch-wise) Inference for memory efficiency.
+- PSNR and SSIM metric calculation.
+- Saving restored images as .npy files.
+
+Usage:
+    python testing_udc.py --model-type student --checkpoint-path ./ckpt.pth --eval-mode full
+"""
 import os
 import sys
 import argparse
@@ -279,8 +292,13 @@ def evaluate_model_on_split(
         print(f"--- [Teacher] Model initialized.")
     elif model_type == "student":
         print(f"--- [Student] Initializing with 4 in-channels and 4 out-channels.")
-        model = UNetStudent(in_channels=4, out_channels=4).to(device)
-        print(f"--- [Student] Model initialized with frequency blocks.")
+        enable_skip_freq = (model_variant == "v2")
+        model = UNetStudent(
+            in_channels=4, 
+            out_channels=4, 
+            enable_skip_freq=enable_skip_freq
+        ).to(device)
+        print(f"--- [Student] Model initialized with frequency blocks (SkipFreq={enable_skip_freq}).")
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 

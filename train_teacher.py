@@ -1,13 +1,11 @@
 # File: train_teacher.py
 """
-Unified teacher training script for UDC-SIT.
+Unified Teacher Training Script for UDC-SIT.
 
-Trains the FrequencyAwareTeacher (MambaIR + Frequency Branch) on 4-channel .npy patches.
-Supports both 'v1' (Amplitude Loss) and 'v2' (Multi-Scale Amplitude + Phase Loss) variants.
+Trains the Frequency-Aware Teacher model (MambaIR v2 + Frequency Branch).
+Supports both 'v1' (Baseline) and 'v2' (Proposed) architectural variants.
 
 Key Features:
-- Dynamic model variant selection.
-- Mixed-precision training (AMP).
 - Comprehensive logging (Loss history, LPIPS, Checkpoints).
 - Google Drive integration for persistent storage.
 """
@@ -277,11 +275,11 @@ def main():
     # Both variants use the same class structure now, but we keep the alias for clarity/compatibility
     if args.model_variant == "v2":
         model = FrequencyAwareTeacherV2(
-            in_channels=4, out_channels=4, img_size=args.patch_size
+            in_channels=4, out_channels=4, img_size=args.patch_size, variant="v2"
         ).to(device)
     else:
         model = FrequencyAwareTeacher(
-            in_channels=4, out_channels=4, img_size=args.patch_size
+            in_channels=4, out_channels=4, img_size=args.patch_size, variant="v1"
         ).to(device)
 
     # Resume Training

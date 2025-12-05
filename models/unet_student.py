@@ -1,6 +1,13 @@
+"""
+U-Net Student Network for UDC Image Restoration.
+
+Lightweight architecture designed for efficient inference, incorporating
+dual-domain features distilled from the teacher network.
+"""
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from models.basic_block import ResBlock, ConvBlock
 from models.frequency_block import FrequencyDomainBlock
 
 class ConvBlock(nn.Module):
@@ -64,9 +71,9 @@ class UNetStudent(nn.Module):
         * highest-res skip (diffraction / high-frequency artifacts)
     - feature_head projects bottleneck to 4-ch for KD.
     """
-    def __init__(self, in_channels=4, out_channels=4, n_base_filters=64, bilinear=True):
+    def __init__(self, in_channels=4, out_channels=4, n_base_filters=64, bilinear=True, enable_skip_freq=True):
         super(UNetStudent, self).__init__()
-        print(f"--- [Student] Initializing with {in_channels} in-channels and {out_channels} out-channels.")
+        self.enable_skip_freq = enable_skip_freq
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.bilinear = bilinear
@@ -81,7 +88,11 @@ class UNetStudent(nn.Module):
         # Frequency blocks
         bottleneck_channels = n_base_filters * 16 // factor
         self.freq_bottleneck = FrequencyDomainBlock(in_channels=bottleneck_channels)
-        self.freq_skip_high  = FrequencyDomainBlock(in_channels=n_base_filters)
+        
+        if self.enable_skip_freq:
+            self.freq_skip_high = FrequencyDomainBlock(in_channels=n_base_filters)
+        else:
+            self.freq_skip_high = None
 
         self.up1 = Up(n_base_filters * 16, n_base_filters * 8 // factor, bilinear)
         self.up2 = Up(n_base_filters * 8,  n_base_filters * 4 // factor, bilinear)
@@ -93,7 +104,6 @@ class UNetStudent(nn.Module):
         # Feature map for KD: project bottleneck to 4 channels
         self.feature_head = nn.Conv2d(bottleneck_channels, 4, kernel_size=1)
 
-        print("--- [Student] Model initialized with frequency blocks.")
 
     def forward(self, x):
         # Encoder
@@ -109,8 +119,11 @@ class UNetStudent(nn.Module):
         # Feature map for KD from bottleneck
         feature_map = self.feature_head(bottleneck)  # (B,4,H/16,W/16)
 
-        # Frequency on high-res skip (x1)
-        x1_enh = x1 + self.freq_skip_high(x1)
+        # Frequency on high-res skip (x1) - Conditional
+        if self.enable_skip_freq and self.freq_skip_high is not None:
+            x1_enh = x1 + self.freq_skip_high(x1)
+        else:
+            x1_enh = x1
 
         # Decoder
         x = self.up1(bottleneck, x4)
