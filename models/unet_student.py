@@ -1,8 +1,8 @@
 """
-U-Net Student Network for UDC Image Restoration.
+U-Net Student Network for UDC Image Restoration
 
 Lightweight architecture designed for efficient inference, incorporating
-dual-domain features distilled from the teacher network.
+dual-domain features distilled from the teacher network
 """
 
 import torch

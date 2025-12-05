@@ -1,26 +1,24 @@
-# File: models/mambair_teacher.py
 import torch
 import torch.nn as nn
-
 from models.frequency_block import FrequencyDomainBlock
 from basicsr.archs.mambairv2_arch import MambaIRv2 as OfficialMambaIR
 
 
 class FrequencyAwareTeacher(nn.Module):
     """
-    Frequency-Aware Teacher Network for UDC Image Restoration.
+    Frequency-Aware Teacher Network for UDC Image Restoration
     
     Integrates a Spatial Branch (MambaIR v2) and a parallel Frequency Branch
-    to handle both global diffraction artifacts and local details.
+    to handle both global diffraction artifacts and local details
     
     Args:
-        in_channels (int): Number of input channels (default: 4 for RAW).
-        out_channels (int): Number of output channels (default: 4).
-        img_size (int): Input image size (default: 256).
-        embed_dim (int): Embedding dimension for MambaIRv2 (default: 96).
-        depths (tuple): Depths of MambaIRv2 stages (default: (2, 2, 2, 2)).
-        variant (str): 'v1' or 'v2' to select fusion strategy (default: 'v2').
-        **kwargs: Additional keyword arguments for MambaIRv2.
+        in_channels (int): Number of input channels (default: 4 for RAW)
+        out_channels (int): Number of output channels (default: 4)
+        img_size (int): Input image size (default: 256)
+        embed_dim (int): Embedding dimension for MambaIRv2 (default: 96)
+        depths (tuple): Depths of MambaIRv2 stages (default: (2, 2, 2, 2))
+        variant (str): 'v1' or 'v2' to select fusion strategy (default: 'v2')
+        **kwargs: Additional keyword arguments for MambaIRv2
     """
     def __init__(
         self,

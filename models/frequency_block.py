@@ -1,10 +1,8 @@
 """
-Frequency Domain Processing Modules.
-
-Implements blocks for handling Fourier domain operations, including:
-- FFT/IFFT transformations.
-- Amplitude and phase processing.
-- Frequency-domain feature extraction.
+Frequency Domain Processing Modules implementing blocks for handling Fourier domain operations, including:
+- FFT/IFFT transformations
+- Amplitude and phase processing
+- Frequency-domain feature extraction
 """
 
 import torch
@@ -13,13 +11,13 @@ from torch.cuda.amp import autocast
 
 class FrequencyDomainBlock(nn.Module):
     """
-    Extracts frequency-domain features using 2D FFT.
+    Extracts frequency-domain features using 2D FFT
     
     Processes the amplitude and phase components of the input signal
-    to capture global degradation patterns inherent in UDC images.
+    to capture global degradation patterns inherent in UDC images
     
     Args:
-        in_channels (int): Number of input channels.
+        in_channels (int): Number of input channels
     """
     def __init__(self, in_channels, num_kernels=64):
         super().__init__()

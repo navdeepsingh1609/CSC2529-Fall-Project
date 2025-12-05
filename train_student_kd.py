@@ -1,5 +1,5 @@
 """
-Unified Knowledge Distillation (KD) Training Script for UDC-SIT.
+Unified Knowledge Distillation (KD) Training Script for UDC-SIT
 
 Trains the lightweight UNetStudent model by distilling knowledge from a frozen 
 Frequency-Aware Teacher. Implements a multi-objective loss function including:
@@ -18,7 +18,6 @@ import os
 import sys
 import argparse
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

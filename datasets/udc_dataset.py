@@ -1,7 +1,5 @@
 """
-UDC-SIT Dataset Loader.
-
-Handles loading and preprocessing of the UDC-SIT dataset (Numpy format).
+UDC-SIT Dataset Loader - Handles loading and preprocessing of the UDC-SIT dataset
 Supports:
 - Loading Input/GT pairs for Training, Validation, and Testing.
 - On-the-fly random cropping and augmentation (flip/rotation).
@@ -17,8 +15,6 @@ import random
 
 class UDCDataset(Dataset):
     """
-    PyTorch Dataset for UDC-SIT (Under-Display Camera) data.
-    
     Expects data structure:
         root/
             split/ (training/validation/testing)

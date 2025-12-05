@@ -1,13 +1,12 @@
-# File: testing_udc.py
 """
-Unified Evaluation Script for UDC Image Restoration.
+Unified Evaluation Script for UDC Image Restoration
 
-Performs evaluation of trained Teacher or Student models on the UDC-SIT test set.
+Performs evaluation of trained Teacher or Student models on the UDC-SIT test set
 Supports:
-- Full-Resolution Inference.
-- Tiled (Patch-wise) Inference for memory efficiency.
-- PSNR and SSIM metric calculation.
-- Saving restored images as .npy files.
+- Full-Resolution Inference
+- Tiled (Patch-wise) Inference for memory efficiency
+- PSNR and SSIM metric calculation
+- Saving restored images as .npy files
 
 Usage:
     python testing_udc.py --model-type student --checkpoint-path ./ckpt.pth --eval-mode full
@@ -114,13 +113,13 @@ def run_model_tiled(
     device: torch.device,
 ):
     """
-    Run model on full 4-ch image by tiling into non-overlapping patches.
+    Run model on full 4-ch image by tiling into non-overlapping patches
 
     Args:
-        model: restoration network, expects (B,4,H,W) in [0,1].
-        udc_full_4ch: (4, H, W) tensor in [0,1].
-        patch_size: patch height/width.
-        patch_batch: number of patches per forward pass.
+        model: restoration network, expects (B,4,H,W) in [0,1]
+        udc_full_4ch: (4, H, W) tensor in [0,1]
+        patch_size: patch height/width
+        patch_batch: number of patches per forward pass
         device: torch.device.
 
     Returns:
@@ -168,7 +167,7 @@ def run_model_full_image(
     patch_batch: int,
 ):
     """
-    Try full-image inference; if that fails with CUDA OOM, fall back to tiled inference.
+    Try full-image inference; if that fails with CUDA OOM, fall back to tiled inference
 
     Args:
         model: restoration network
@@ -204,11 +203,11 @@ def compute_metrics_raw_and_lpips(
     device: torch.device,
 ):
     """
-    Compute PSNR/SSIM in 4-channel (Bayer-like) domain and LPIPS on pseudo-RGB.
+    Compute PSNR/SSIM in 4-channel (Bayer-like) domain and LPIPS on pseudo-RGB
 
     Args:
         pred_4ch, gt_4ch: (4,H,W) in [0,1]
-        lpips_model: LPIPS(net='vgg') already moved to device.
+        lpips_model: LPIPS(net='vgg') already moved to device
 
     Returns:
         psnr (float), ssim (float), lpips_rgb (float)
@@ -255,7 +254,7 @@ def evaluate_model_on_split(
     model_variant: str = "v1",
 ):
     """
-    Evaluate a teacher or student model on the given split.
+    Evaluate a teacher or student model on the given split
 
     Saves:
         - 4-ch predictions as .npy in [0, 1023] if save_npy=True

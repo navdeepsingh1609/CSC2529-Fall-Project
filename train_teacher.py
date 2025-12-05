@@ -1,6 +1,5 @@
-# File: train_teacher.py
 """
-Unified Teacher Training Script for UDC-SIT.
+Unified Teacher Training Script for UDC-SIT
 
 Trains the Frequency-Aware Teacher model (MambaIR v2 + Frequency Branch).
 Supports both 'v1' (Baseline) and 'v2' (Proposed) architectural variants.

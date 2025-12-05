@@ -26,6 +26,6 @@ viz_panels/
 *.html
 architecture_and_workflow.md
 architecture_model2.md
-generate_methodology_docx.py
 Methodology.docx
 methodology.tex
+temp
