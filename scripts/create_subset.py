@@ -1,18 +1,7 @@
 import os
 import glob
 import shutil
-
-# --- Config ---
-# Point SOURCE_DIR to the EXTRACTED dataset location on Colab local disk
-# after you untar into /content/dataset/UDC-SIT.
-SOURCE_DIR = "/content/drive/MyDrive/Computational Imaging Project/UDC-SIT/UDC-SIT"
-
-# Target paths (where the small subset will be)
-TARGET_DIR = "data/UDC-SIT_subset"
-
-NUM_TRAIN_FILES = 25   # Number of training files to copy
-NUM_VAL_FILES   = 5   # Number of validation files to copy
-# --------------
+import argparse
 
 def copy_subset(source_input_dir, source_gt_dir, target_input_dir, target_gt_dir, num_files):
     """Helper function to copy a subset of files."""
@@ -38,23 +27,35 @@ def copy_subset(source_input_dir, source_gt_dir, target_input_dir, target_gt_dir
         else:
             print(f"Warning: Missing GT file for {filename}")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Create a small subset of the UDC dataset.")
+    parser.add_argument("--source-root", type=str, default="/content/dataset/UDC-SIT", help="Root of the full dataset.")
+    parser.add_argument("--target-root", type=str, default="data/UDC-SIT_subset", help="Where to create the subset.")
+    parser.add_argument("--n-train", type=int, default=30, help="Number of training images.")
+    parser.add_argument("--n-val", type=int, default=8, help="Number of validation images.")
+    return parser.parse_args()
+
 def main():
-    print("Creating training subset...")
+    args = parse_args()
+    
+    print(f"Creating subset from {args.source_root} to {args.target_root}...")
+    
+    # Training
     copy_subset(
-        source_input_dir=os.path.join(SOURCE_DIR, "training/input"),
-        source_gt_dir=os.path.join(SOURCE_DIR, "training/GT"),
-        target_input_dir=os.path.join(TARGET_DIR, "train/input"),
-        target_gt_dir=os.path.join(TARGET_DIR, "train/GT"),
-        num_files=NUM_TRAIN_FILES
+        source_input_dir=os.path.join(args.source_root, "training/input"),
+        source_gt_dir=os.path.join(args.source_root, "training/GT"),
+        target_input_dir=os.path.join(args.target_root, "training/input"),
+        target_gt_dir=os.path.join(args.target_root, "training/GT"),
+        num_files=args.n_train
     )
 
-    print("Creating validation subset...")
+    # Validation
     copy_subset(
-        source_input_dir=os.path.join(SOURCE_DIR, "validation/input"),
-        source_gt_dir=os.path.join(SOURCE_DIR, "validation/GT"),
-        target_input_dir=os.path.join(TARGET_DIR, "val/input"),
-        target_gt_dir=os.path.join(TARGET_DIR, "val/GT"),
-        num_files=NUM_VAL_FILES
+        source_input_dir=os.path.join(args.source_root, "validation/input"),
+        source_gt_dir=os.path.join(args.source_root, "validation/GT"),
+        target_input_dir=os.path.join(args.target_root, "validation/input"),
+        target_gt_dir=os.path.join(args.target_root, "validation/GT"),
+        num_files=args.n_val
     )
 
     print("Subset creation complete.")

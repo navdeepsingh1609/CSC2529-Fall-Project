@@ -476,385 +476,58 @@ def evaluate_model_on_split(
 
         copy_if_needed(metrics_csv_path, os.path.join(drive_model_dir, "metrics_raw.csv"))
         copy_if_needed(summary_path, os.path.join(drive_model_dir, "metrics_summary.txt"))
-# File: testing_udc.py
-"""
-Unified testing script for UDC-SIT.
-
-Evaluates trained models (Teacher or Student) on the UDC-SIT test set.
-Metrics: PSNR, SSIM, LPIPS.
-Outputs:
-- .npy predictions
-- Visualization panels (Input, GT, Pred)
-- Metrics summary (CSV/JSON)
-
-Key Features:
-- Supports 'v1' and 'v2' model variants.
-- Full-image inference (with optional tiling).
-- Google Drive integration for saving results.
-"""
-
-import os
-import sys
-import argparse
-import numpy as np
-import cv2
-import json
-import csv
-from tqdm import tqdm
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-import lpips
-import matplotlib.pyplot as plt
-
-# Optimize for speed
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False
-
-# Ensure MambaIR submodule is in path
-project_root = os.getcwd()
-mambair_path = os.path.join(project_root, 'models', 'external', 'MambaIR')
-if mambair_path not in sys.path:
-    sys.path.insert(0, mambair_path)
-
-from datasets.udc_dataset import UDCDataset
-from models.mambair_teacher import FrequencyAwareTeacher, FrequencyAwareTeacherV2
-from models.unet_student import UNetStudent
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate UDC models (Teacher/Student).")
-    
-    # Model Configuration
-    parser.add_argument(
-        "--model-type",
-        type=str,
-        required=True,
-        choices=["teacher", "student"],
-        help="Type of model to evaluate.",
-    )
-    parser.add_argument(
-        "--model-variant",
-        type=str,
-        choices=["v1", "v2"],
-        default="v1",
-        help="Model variant: 'v1' or 'v2'.",
-    )
-    parser.add_argument(
-        "--checkpoint-path",
-        type=str,
-        required=True,
-        help="Path to the model checkpoint (.pth).",
-    )
-
-    # Data Configuration
-    parser.add_argument(
-        "--data-root",
-        type=str,
-        default=None,
-        help="Root directory containing 'testing' subfolder.",
-    )
-    parser.add_argument(
-        "--test-dir",
-        type=str,
-        default="/content/dataset/UDC-SIT/testing",
-        help="Testing data directory.",
-    )
-    
-    # Output Configuration
-    parser.add_argument(
-        "--results-root",
-        type=str,
-        default="results",
-        help="Local directory for saving results.",
-    )
-    parser.add_argument(
-        "--drive-results-root",
-        type=str,
-        default="/content/drive/MyDrive/Computational Imaging Project/results",
-        help="Drive directory for mirroring results.",
-    )
-    parser.add_argument(
-        "--save-npy",
-        dest="save_npy",
-        action="store_true",
-        help="Save predicted .npy files (default).",
-    )
-    parser.add_argument(
-        "--no-save-npy",
-        dest="save_npy",
-        action="store_false",
-        help="Do not save predicted .npy files.",
-    )
-
-    # Inference Hyperparameters
-    parser.add_argument(
-        "--patch-size",
-        type=int,
-        default=256,
-        help="Patch size for tiled inference (if needed).",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=1,
-        help="Batch size (usually 1 for full-image testing).",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="DataLoader worker count.",
-    )
-
-    parser.set_defaults(save_npy=True)
+    parser.add_argument("--model-type", type=str, required=True, choices=["teacher", "student"], help="Type of model to evaluate.")
+    parser.add_argument("--model-variant", type=str, choices=["v1", "v2"], default="v1", help="Model variant: 'v1' or 'v2'.")
+    parser.add_argument("--checkpoint-path", type=str, required=True, help="Path to the model checkpoint (.pth).")
+    parser.add_argument("--data-root", type=str, required=True, help="Root directory containing split subfolders (e.g. 'testing', 'validation').")
+    parser.add_argument("--split", type=str, default="testing", help="Split to evaluate on (e.g. 'testing', 'validation').")
+    parser.add_argument("--results-root", type=str, default="results", help="Local directory for saving results.")
+    parser.add_argument("--drive-results-root", type=str, default="", help="Drive directory for mirroring results.")
+    parser.add_argument("--save-npy", action="store_true", default=True, help="Save predicted .npy files.")
+    parser.add_argument("--patch-size", type=int, default=256, help="Patch size for tiled inference.")
+    parser.add_argument("--patch-batch", type=int, default=4, help="Batch size for tiled inference.")
+    parser.add_argument("--max-images", type=int, default=None, help="Limit number of images.")
+    parser.add_argument("--use-tiling", action="store_true", help="Force tiled inference.")
+    parser.add_argument("--eval-mode", type=str, default="full", choices=["full", "center_patch"], help="Evaluation mode.")
+    parser.add_argument("--num-plot-examples", type=int, default=5, help="Number of visualization panels to save.")
     return parser.parse_args()
-
-
-def calculate_psnr(img1, img2):
-    """Calculates PSNR between two images [0, 1]."""
-    mse = np.mean((img1 - img2) ** 2)
-    if mse == 0:
-        return 100
-    return 20 * np.log10(1.0 / np.sqrt(mse))
-
-
-def calculate_ssim(img1, img2):
-    """Calculates SSIM (using skimage) between two images [0, 1]."""
-    from skimage.metrics import structural_similarity as ssim
-    # Data range is 1.0 because images are normalized to [0, 1]
-    return ssim(img1, img2, data_range=1.0, channel_axis=2)
-
-
-def save_visualization(input_img, gt_img, pred_img, save_path):
-    """Saves a side-by-side comparison panel."""
-    # Convert to uint8 for display
-    def to_uint8(x):
-        return (np.clip(x, 0, 1) * 255).astype(np.uint8)
-
-    input_u8 = to_uint8(input_img)
-    gt_u8    = to_uint8(gt_img)
-    pred_u8  = to_uint8(pred_img)
-
-    # Create panel
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    axes[0].imshow(input_u8)
-    axes[0].set_title("Input (Mosaic)")
-    axes[0].axis("off")
-
-    axes[1].imshow(pred_u8)
-    axes[1].set_title("Prediction")
-    axes[1].axis("off")
-
-    axes[2].imshow(gt_u8)
-    axes[2].set_title("Ground Truth")
-    axes[2].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    plt.close(fig)
-
-
-def evaluate_model_on_split(
-    model,
-    data_loader,
-    device,
-    lpips_fn,
-    save_dir,
-    save_npy=True,
-    model_variant="v1"
-):
-    """
-    Runs evaluation loop: inference -> metrics -> saving.
-    Returns dictionary of average metrics.
-    """
-    model.eval()
-    
-    psnr_list = []
-    ssim_list = []
-    lpips_list = []
-
-    # Create subdirectories
-    npy_dir = os.path.join(save_dir, "npy_predictions")
-    vis_dir = os.path.join(save_dir, "visualizations")
-    os.makedirs(npy_dir, exist_ok=True)
-    os.makedirs(vis_dir, exist_ok=True)
-
-    print(f"--- [Test] Starting evaluation on {len(data_loader)} images...")
-
-    with torch.no_grad():
-        for i, (udc_batch, gt_batch) in enumerate(tqdm(data_loader)):
-            udc_batch = udc_batch.to(device)
-            gt_batch  = gt_batch.to(device)
-
-            # Inference
-            # For simplicity, assuming full-image inference fits in memory.
-            # If OOM occurs, tiling logic would be needed here.
-            if isinstance(model, UNetStudent):
-                pred_batch, _ = model(udc_batch)
-            else:
-                # Teacher returns (pred, spatial, freq)
-                pred_batch, _, _ = model(udc_batch)
-
-            pred_batch = torch.clamp(pred_batch, 0, 1)
-
-            # Calculate LPIPS (batch-wise)
-            # LPIPS expects [-1, 1]
-            lpips_val = lpips_fn(
-                pred_batch[:, :3, :, :] * 2.0 - 1.0,
-                gt_batch[:, :3, :, :]   * 2.0 - 1.0
-            ).mean().item()
-            lpips_list.append(lpips_val)
-
-            # Per-sample metrics (PSNR, SSIM) & Saving
-            B = udc_batch.shape[0]
-            for b in range(B):
-                # Convert to numpy (H, W, C)
-                pred_np = pred_batch[b].permute(1, 2, 0).cpu().numpy()
-                gt_np   = gt_batch[b].permute(1, 2, 0).cpu().numpy()
-                inp_np  = udc_batch[b].permute(1, 2, 0).cpu().numpy()
-
-                # PSNR & SSIM on RGB channels (first 3)
-                # Assuming 4th channel is IR or similar, usually standard metrics focus on RGB.
-                # Adjust if 4-channel metric is required.
-                pred_rgb = pred_np[:, :, :3]
-                gt_rgb   = gt_np[:, :, :3]
-                inp_rgb  = inp_np[:, :, :3]
-
-                psnr_val = calculate_psnr(pred_rgb, gt_rgb)
-                ssim_val = calculate_ssim(pred_rgb, gt_rgb)
-
-                psnr_list.append(psnr_val)
-                ssim_list.append(ssim_val)
-
-                # Save results
-                idx = i * B + b
-                if save_npy:
-                    np.save(os.path.join(npy_dir, f"pred_{idx:04d}.npy"), pred_np)
-                
-                # Save visualization for first few images or all?
-                # Let's save for all to be safe, or maybe first 50.
-                if idx < 50:
-                    save_visualization(
-                        inp_rgb, gt_rgb, pred_rgb,
-                        os.path.join(vis_dir, f"vis_{idx:04d}.png")
-                    )
-
-    avg_psnr = np.mean(psnr_list)
-    avg_ssim = np.mean(ssim_list)
-    avg_lpips = np.mean(lpips_list)
-
-    print(f"\n--- [Test] Results ---")
-    print(f"PSNR:  {avg_psnr:.4f}")
-    print(f"SSIM:  {avg_ssim:.4f}")
-    print(f"LPIPS: {avg_lpips:.4f}")
-
-    return {
-        "psnr": avg_psnr,
-        "ssim": avg_ssim,
-        "lpips": avg_lpips
-    }
 
 
 def main():
     args = parse_args()
-    if args.data_root:
-        args.test_dir = os.path.join(args.data_root, "testing")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Setup output directories
-    os.makedirs(args.results_root, exist_ok=True)
-    os.makedirs(args.drive_results_root, exist_ok=True)
-
-    print("\n--- [Config] Testing Configuration ---")
-    print(f"Model Type:    {args.model_type}")
-    print(f"Variant:       {args.model_variant}")
-    print(f"Checkpoint:    {args.checkpoint_path}")
-    print(f"Test Dir:      {args.test_dir}")
-    print(f"Results Dir:   {args.results_root}")
-    print(f"Drive Mirror:  {args.drive_results_root}")
-    print(f"Save NPY:      {args.save_npy}")
-    print("--------------------------------------\n")
-
-    # Initialize Model
-    print(f"--- [Model] Initializing {args.model_type} ({args.model_variant})...")
-    if args.model_type == "teacher":
-        if args.model_variant == "v2":
-            model = FrequencyAwareTeacherV2(in_channels=4, out_channels=4).to(device)
-        else:
-            model = FrequencyAwareTeacher(in_channels=4, out_channels=4).to(device)
-    elif args.model_type == "student":
-        model = UNetStudent(in_channels=4, out_channels=4).to(device)
-    else:
-        raise ValueError(f"Unknown model type: {args.model_type}")
-
-    # Load Checkpoint
-    if not os.path.exists(args.checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found at {args.checkpoint_path}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"--- [testing_udc] Device: {device}")
     
-    state = torch.load(args.checkpoint_path, map_location=device)
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
-    model.load_state_dict(state)
-    print(f"--- [Model] Loaded weights from {args.checkpoint_path}")
-
-    # Initialize Data
-    # Note: Using is_train=False for testing to avoid augmentation
-    test_dataset = UDCDataset(
-        args.test_dir,
+    # Initialize LPIPS
+    print("--- [testing_udc] Initializing LPIPS...")
+    lpips_model = lpips.LPIPS(net='vgg').to(device)
+    
+    model_name = f"{args.model_type}_{args.model_variant}"
+    
+    evaluate_model_on_split(
+        model_name=model_name,
+        model_type=args.model_type,
+        weights_path=args.checkpoint_path,
+        data_root=args.data_root,
+        split=args.split,
         patch_size=args.patch_size,
-        is_train=False
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device == "cuda")
-    )
-
-    # Initialize Metric
-    lpips_fn = lpips.LPIPS(net='vgg').to(device)
-
-    # Run Evaluation
-    metrics = evaluate_model_on_split(
-        model,
-        test_loader,
-        device,
-        lpips_fn,
-        args.results_root,
+        patch_batch=args.patch_batch,
+        max_images=args.max_images,
+        results_root=args.results_root,
+        drive_results_root=args.drive_results_root,
         save_npy=args.save_npy,
-        model_variant=args.model_variant
+        use_tiling=args.use_tiling,
+        eval_mode=args.eval_mode,
+        num_plot_examples=args.num_plot_examples,
+        lpips_model=lpips_model,
+        device=device,
+        model_variant=args.model_variant,
     )
-
-    # Save Metrics
-    metrics_path = os.path.join(args.results_root, "metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=4)
-    
-    print(f"--- [Test] Metrics saved to {metrics_path}")
-
-    # Mirror to Drive
-    try:
-        import shutil
-        # Copy entire results folder content to drive
-        # Using distutils.dir_util.copy_tree or shutil.copytree with dirs_exist_ok
-        # shutil.copytree(args.results_root, args.drive_results_root, dirs_exist_ok=True)
-        # Simple walk copy to be safe
-        for root, dirs, files in os.walk(args.results_root):
-            rel_path = os.path.relpath(root, args.results_root)
-            dest_dir = os.path.join(args.drive_results_root, rel_path)
-            os.makedirs(dest_dir, exist_ok=True)
-            for file in files:
-                src_file = os.path.join(root, file)
-                dst_file = os.path.join(dest_dir, file)
-                shutil.copy2(src_file, dst_file)
-        print(f"--- [Test] Results mirrored to {args.drive_results_root}")
-    except Exception as e:
-        print(f"Warning: Could not mirror results to Drive: {e}")
 
 
 if __name__ == "__main__":
