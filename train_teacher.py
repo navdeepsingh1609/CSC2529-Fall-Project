@@ -29,6 +29,8 @@ import matplotlib.pyplot as plt
 # Optimize for speed on Colab
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # Ensure MambaIR submodule is in path
 project_root = os.getcwd()
