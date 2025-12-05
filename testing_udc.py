@@ -477,6 +477,14 @@ def evaluate_model_on_split(
         copy_if_needed(metrics_csv_path, os.path.join(drive_model_dir, "metrics_raw.csv"))
         copy_if_needed(summary_path, os.path.join(drive_model_dir, "metrics_summary.txt"))
 
+        if save_npy and npy_out_dir is not None:
+            drive_npy_dir = os.path.join(drive_model_dir, "npy")
+            if os.path.abspath(npy_out_dir) != os.path.abspath(drive_npy_dir):
+                if os.path.exists(drive_npy_dir):
+                    shutil.rmtree(drive_npy_dir)
+                shutil.copytree(npy_out_dir, drive_npy_dir)
+                print(f"Copied .npy predictions to {drive_npy_dir}")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate UDC models (Teacher/Student).")
