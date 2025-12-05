@@ -43,7 +43,6 @@ Under-Display Camera (UDC) technology enables full-screen displays but introduce
 
 ```bash
 pip install -r requirements.txt
-pip install timm mamba-ssm causal-conv1d
 ```
 
 ### 2. Training
@@ -85,10 +84,6 @@ python testing_udc.py \
 | **Fusion Mechanism** | Direct Concatenation | Gated Fusion (Spatial-guided) |
 | **Frequency Loss** | Amplitude Only (L1) | Multi-Scale Amplitude + Phase |
 | **Student Architecture** | Standard U-Net | U-Net + High-Res Skip Frequency Block |
-
-## Methodology
-
-For a detailed mathematical formulation of the loss functions and architectural decisions, please refer to `Methodology.docx` or `methodology.tex`.
 
 ## Acknowledgements
 
